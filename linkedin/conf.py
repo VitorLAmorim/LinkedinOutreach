@@ -1,6 +1,7 @@
 # linkedin/conf.py
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -20,8 +21,8 @@ FIXTURE_PROFILES_DIR = FIXTURE_DIR / "profiles"
 FIXTURE_PAGES_DIR = FIXTURE_DIR / "pages"
 DUMP_PAGES = False
 
-MIN_DELAY = 5
-MAX_DELAY = 8
+MIN_DELAY = int(os.getenv("MIN_DELAY", "5"))
+MAX_DELAY = int(os.getenv("MAX_DELAY", "8"))
 
 # ----------------------------------------------------------------------
 # Browser config
@@ -45,9 +46,9 @@ DEFAULT_FOLLOW_UP_DAILY_LIMIT = 100
 # Set to False to run 24/7.
 # ----------------------------------------------------------------------
 ENABLE_ACTIVE_HOURS = False
-ACTIVE_START_HOUR = 10   # inclusive, local time
-ACTIVE_END_HOUR = 20    # exclusive, local time
-ACTIVE_TIMEZONE = "UTC"
+ACTIVE_START_HOUR = int(os.getenv("ACTIVE_START_HOUR", "10"))   # inclusive, local time
+ACTIVE_END_HOUR = int(os.getenv("ACTIVE_END_HOUR", "20"))      # exclusive, local time
+ACTIVE_TIMEZONE = os.getenv("ACTIVE_TIMEZONE", "UTC")
 REST_DAYS = (5, 6)      # 0=Mon … 6=Sun; default Sat+Sun off
 
 # ----------------------------------------------------------------------
@@ -56,13 +57,14 @@ REST_DAYS = (5, 6)      # 0=Mon … 6=Sun; default Sat+Sun off
 CAMPAIGN_CONFIG = {
     "check_pending_recheck_after_hours": 24,
     "enrich_min_interval": 1,
-    "min_action_interval": 120,
+    "min_action_interval": int(os.getenv("MIN_ACTION_INTERVAL", "120")),
     "qualification_n_mc_samples": 100,
     "min_ready_to_connect_prob": 0.9,
     "min_positive_pool_prob": 0.20,
     "embedding_model": "BAAI/bge-small-en-v1.5",
     "connect_delay_seconds": 10,
     "connect_no_candidate_delay_seconds": 300,
+    "default_spread_window_hours": int(os.getenv("DEFAULT_SPREAD_WINDOW_HOURS", "10")),
 }
 
 # ----------------------------------------------------------------------
@@ -74,4 +76,6 @@ def get_llm_config():
     from linkedin.models import SiteConfig
     cfg = SiteConfig.load()
     return cfg.llm_api_key, cfg.ai_model, cfg.llm_api_base or None
+
+PROXY_URL = os.getenv("PROXY_URL")
 

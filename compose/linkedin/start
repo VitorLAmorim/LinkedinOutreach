@@ -5,18 +5,48 @@ set -o errexit
 set -o pipefail
 set -o nounset
 
-# Virtual display (always needed — Playwright launches headed mode)
+# --- Admin-only mode (Django Admin web server, no browser) ---
+if [ "${RUN_MODE:-daemon}" = "admin" ]; then
+    python manage.py migrate --no-input
+    python manage.py setup_crm
+    exec python manage.py runserver 0.0.0.0:8000
+fi
+
+# --- Worker modes (need virtual display for Playwright headed mode) ---
+
+# Clean up any leftover X server lock files
 rm -f /tmp/.X99-lock
+
+# Start Xvfb on display :99 with a reasonable resolution
 Xvfb :99 -screen 0 1920x1080x24 &
 sleep 1
 export DISPLAY=:99
 
 # VNC remote access (only for open-source local use)
 if [ "${ENABLE_VNC:-false}" = "true" ]; then
-    x11vnc -display :99 -forever -shared -nopw &
+    x11vnc -display :99 -forever -shared -nopw -rfbport 5900 &
     websockify --web /opt/noVNC 6080 localhost:5900 &
 fi
 
+# --- Setup mode (interactive VNC login) ---
+if [ "${RUN_MODE:-daemon}" = "setup" ]; then
+    python manage.py migrate --no-input
+    python manage.py setup_crm
+    exec python manage.py setup_account "$LINKEDIN_PROFILE"
+fi
+
+# --- Browse mode (browser + VNC, no automation) ---
+if [ "${RUN_MODE:-daemon}" = "browse" ]; then
+    python manage.py migrate --no-input
+    python manage.py setup_crm
+    exec python manage.py browse_account "$LINKEDIN_PROFILE"
+fi
+
+# --- Default: daemon mode ---
 # Run the daemon (migrate + onboard + task queue).
 # Forward any arguments, e.g. --onboard <file>.
-exec python manage.py rundaemon "$@"
+if [ -n "${LINKEDIN_PROFILE:-}" ]; then
+    exec python manage.py rundaemon --profile "$LINKEDIN_PROFILE" "$@"
+else
+    exec python manage.py rundaemon "$@"
+fi

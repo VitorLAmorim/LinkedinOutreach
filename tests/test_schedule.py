@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from linkedin.daemon import seconds_until_active
+from linkedin.daemon import remaining_active_seconds, seconds_until_active
 
 
 def _mock_now(year, month, day, hour, minute=0, tz="UTC"):
@@ -118,3 +118,55 @@ class TestSecondsUntilActive:
         # Outside hours on a rest day — should still return 0 when disabled
         with patch("linkedin.daemon.timezone.localtime", return_value=_mock_now(2026, 3, 21, 23)):
             assert seconds_until_active() == 0.0
+
+
+class TestRemainingActiveSeconds:
+    @patch("linkedin.daemon.ENABLE_ACTIVE_HOURS", True)
+    @patch("linkedin.daemon.ACTIVE_START_HOUR", 9)
+    @patch("linkedin.daemon.ACTIVE_END_HOUR", 17)
+    @patch("linkedin.daemon.ACTIVE_TIMEZONE", "UTC")
+    @patch("linkedin.daemon.REST_DAYS", (5, 6))
+    def test_inside_window_returns_remaining(self):
+        # Wed noon → 5 hours until 17:00
+        with patch("linkedin.daemon.timezone.localtime", return_value=_mock_now(2026, 3, 18, 12)):
+            result = remaining_active_seconds()
+            assert result == pytest.approx(5 * 3600, abs=1)
+
+    @patch("linkedin.daemon.ENABLE_ACTIVE_HOURS", True)
+    @patch("linkedin.daemon.ACTIVE_START_HOUR", 9)
+    @patch("linkedin.daemon.ACTIVE_END_HOUR", 17)
+    @patch("linkedin.daemon.ACTIVE_TIMEZONE", "UTC")
+    @patch("linkedin.daemon.REST_DAYS", (5, 6))
+    def test_outside_window_returns_zero(self):
+        # Wed 18:00 → outside window
+        with patch("linkedin.daemon.timezone.localtime", return_value=_mock_now(2026, 3, 18, 18)):
+            assert remaining_active_seconds() == 0.0
+
+    @patch("linkedin.daemon.ENABLE_ACTIVE_HOURS", True)
+    @patch("linkedin.daemon.ACTIVE_START_HOUR", 9)
+    @patch("linkedin.daemon.ACTIVE_END_HOUR", 17)
+    @patch("linkedin.daemon.ACTIVE_TIMEZONE", "UTC")
+    @patch("linkedin.daemon.REST_DAYS", (5, 6))
+    def test_rest_day_returns_zero(self):
+        # Sat noon
+        with patch("linkedin.daemon.timezone.localtime", return_value=_mock_now(2026, 3, 21, 12)):
+            assert remaining_active_seconds() == 0.0
+
+    @patch("linkedin.daemon.ENABLE_ACTIVE_HOURS", False)
+    @patch("linkedin.daemon.CAMPAIGN_CONFIG", {"default_spread_window_hours": 10})
+    def test_disabled_returns_capped_value(self):
+        # 2pm → 10h until midnight, but capped at default 10h
+        with patch("linkedin.daemon.timezone.now") as mock_now:
+            mock_now.return_value = _mock_now(2026, 3, 18, 14)
+            result = remaining_active_seconds()
+            # 10h to midnight, cap is also 10h → 10h
+            assert result == pytest.approx(10 * 3600, abs=1)
+
+    @patch("linkedin.daemon.ENABLE_ACTIVE_HOURS", False)
+    @patch("linkedin.daemon.CAMPAIGN_CONFIG", {"default_spread_window_hours": 10})
+    def test_disabled_late_night_uses_midnight(self):
+        # 11pm → only 1h to midnight, less than 10h cap
+        with patch("linkedin.daemon.timezone.now") as mock_now:
+            mock_now.return_value = _mock_now(2026, 3, 18, 23)
+            result = remaining_active_seconds()
+            assert result == pytest.approx(1 * 3600, abs=1)

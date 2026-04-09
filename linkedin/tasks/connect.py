@@ -68,6 +68,38 @@ def strategy_for(campaign, qualifiers):
     )
 
 
+def compute_spread_delay(linkedin_profile, connected: bool) -> float:
+    """Delay to spread connection requests evenly across the active window.
+
+    connected=True (after sending a request): full spread interval.
+    connected=False (search only / no candidate): shorter interval to retry sooner.
+    """
+    from linkedin.daemon import remaining_active_seconds
+    from linkedin.models import ActionLog
+
+    cfg = CAMPAIGN_CONFIG
+    min_interval = cfg["min_action_interval"]
+
+    daily_limit = linkedin_profile.connect_daily_limit or 20
+    used_today = linkedin_profile._daily_count(ActionLog.ActionType.CONNECT)
+    remaining_quota = max(daily_limit - used_today, 1)
+
+    remaining_secs = remaining_active_seconds()
+    if remaining_secs <= 0:
+        return float(min_interval)
+
+    spread = remaining_secs / remaining_quota
+
+    if connected:
+        delay = max(spread, float(min_interval))
+    else:
+        delay = min(spread * 0.25, float(cfg["connect_no_candidate_delay_seconds"]))
+        delay = max(delay, float(cfg["connect_delay_seconds"]))
+
+    jitter = random.uniform(0.8, 1.2)
+    return delay * jitter
+
+
 def _seconds_until_tomorrow() -> float:
     from django.utils import timezone
     import datetime
@@ -88,9 +120,14 @@ def handle_connect(task, session, qualifiers):
     campaign_id = campaign.pk
     strategy = strategy_for(campaign, qualifiers)
 
-    def _reschedule():
-        elapsed = (timezone.now() - task.started_at).total_seconds() if task.started_at else 0
-        enqueue_connect(campaign_id, delay_seconds=strategy.compute_delay(elapsed))
+    def _reschedule(connected: bool = False):
+        if strategy.action_fraction < 1.0:
+            # Freemium: preserve existing throughput-scaling logic
+            elapsed = (timezone.now() - task.started_at).total_seconds() if task.started_at else 0
+            enqueue_connect(campaign_id, delay_seconds=strategy.compute_delay(elapsed))
+        else:
+            delay = compute_spread_delay(session.linkedin_profile, connected=connected)
+            enqueue_connect(campaign_id, delay_seconds=delay)
 
     # --- Rate limit check ---
     if not session.linkedin_profile.can_execute(ActionLog.ActionType.CONNECT):
@@ -100,7 +137,7 @@ def handle_connect(task, session, qualifiers):
     # --- Get candidate ---
     candidate = strategy.find_candidate(session)
     if candidate is None:
-        enqueue_connect(campaign_id, delay_seconds=cfg["connect_no_candidate_delay_seconds"])
+        _reschedule(connected=False)
         return
 
     public_id = candidate["public_identifier"]
@@ -122,13 +159,15 @@ def handle_connect(task, session, qualifiers):
     logger.info("[%s] %s", campaign, colored("\u25b6 connect", "cyan", attrs=["bold"]))
     logger.info("[%s] %s (%s) — %s", campaign, public_id, stats, reason or "")
 
+    connection_sent = False
+
     try:
         status = get_connection_status(session, profile)
 
         if status == ProfileState.CONNECTED:
             set_profile_state(session, public_id, status.value)
             enqueue_follow_up(campaign_id, public_id)
-            _reschedule()
+            _reschedule(connected=False)
             return
 
         if status == ProfileState.PENDING:
@@ -137,7 +176,7 @@ def handle_connect(task, session, qualifiers):
                 campaign_id, public_id,
                 backoff_hours=cfg["check_pending_recheck_after_hours"],
             )
-            _reschedule()
+            _reschedule(connected=False)
             return
 
         # get_connection_status already navigated to the profile page
@@ -155,6 +194,7 @@ def handle_connect(task, session, qualifiers):
                 set_profile_state(session, public_id, new_state.value)
                 logger.debug("%s: connect attempt %d/%d — no button found", public_id, attempts, MAX_CONNECT_ATTEMPTS)
         else:
+            connection_sent = True
             set_profile_state(session, public_id, new_state.value)
             session.linkedin_profile.record_action(
                 ActionLog.ActionType.CONNECT, session.campaign,
@@ -177,7 +217,7 @@ def handle_connect(task, session, qualifiers):
         logger.warning("Skipping %s: %s", public_id, e)
         set_profile_state(session, public_id, ProfileState.FAILED.value)
 
-    _reschedule()
+    _reschedule(connected=connection_sent)
 
 
 # ------------------------------------------------------------------

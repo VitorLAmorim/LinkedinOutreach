@@ -10,11 +10,14 @@ logger = logging.getLogger(__name__)
 class Command(BaseCommand):
     help = "Run the OpenOutreach daemon (onboard, validate, start task queue)."
 
+    def add_arguments(self, parser):
+        parser.add_argument("--profile", default=None, help="Django username to run as (default: first active profile)")
+
     def handle(self, *args, **options):
         self._configure_logging()
         self._ensure_db()
         self._ensure_onboarded()
-        session = self._create_session()
+        session = self._create_session(profile_username=options.get("profile"))
         self._ensure_newsletter(session)
 
         from linkedin.daemon import run_daemon
@@ -54,8 +57,8 @@ class Command(BaseCommand):
             )
             sys.exit(1)
 
-    def _create_session(self):
-        from linkedin.browser.registry import get_first_active_profile, get_or_create_session
+    def _create_session(self, profile_username=None):
+        from linkedin.browser.registry import get_first_active_profile, get_or_create_session, resolve_profile
         from linkedin.conf import get_llm_config
 
         llm_api_key, _, _ = get_llm_config()
@@ -63,7 +66,7 @@ class Command(BaseCommand):
             logger.error("LLM_API_KEY is required. Set it in Site Configuration (Django Admin).")
             sys.exit(1)
 
-        profile = get_first_active_profile()
+        profile = resolve_profile(profile_username) if profile_username else get_first_active_profile()
         if profile is None:
             logger.error("No active LinkedIn profiles found.")
             sys.exit(1)

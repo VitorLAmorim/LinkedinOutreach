@@ -17,11 +17,13 @@ Startup sequence:
 6. **Newsletter** — GDPR override + `ensure_newsletter_subscription()` (marker-guarded, runs once).
 7. **Run** — `run_daemon(session)`.
 
-Docker `start` script handles only Xvfb/VNC setup, then `exec python manage.py rundaemon "$@"`.
+Docker `start` script dispatches on `RUN_MODE` env var: `admin` (Django Admin web server, no browser), `setup` (interactive VNC login), `browse` (browser + VNC, no daemon), default (daemon with `--profile` if `LINKEDIN_PROFILE` set).
 
 ### Other management commands
 
 - `onboard` — standalone onboarding (interactive or `--non-interactive` with `--config-file` / individual flags).
+- `setup_account <username>` — interactive VNC login for a LinkedIn account (polls for auth cookie, saves session).
+- `browse_account <username>` — browser + VNC for manual navigation (no daemon, no automation).
 - `setup_crm` — idempotent CRM bootstrap (default Site).
 - `add_seeds` — add seed LinkedIn profile URLs to a campaign.
 
@@ -46,11 +48,11 @@ Single write path: `apply(config)` — idempotent, creates missing Campaign, Lin
 
 ## Task Queue
 
-Persistent queue backed by `Task` model. Worker loop in `daemon.py`: `seconds_until_active()` guard pauses outside active hours/rest days → pop oldest due task → set campaign on session → RUNNING → dispatch via `_HANDLERS` dict → COMPLETED/FAILED. Failures captured by `failure_diagnostics()` context manager. `heal_tasks()` reconciles on startup. `AuthenticationError` (401) triggers `session.reauthenticate()` and resets the task to pending for automatic retry.
+Persistent queue backed by `Task` model. Worker loop in `daemon.py`: `seconds_until_active()` guard pauses outside active hours/rest days → pop oldest due task → set campaign on session → RUNNING → dispatch via `_HANDLERS` dict → COMPLETED/FAILED. Failures captured by `failure_diagnostics()` context manager. `heal_tasks()` reconciles on startup  (also scoped to own campaigns — won't reset other daemons' running tasks).. `AuthenticationError` (401) triggers `session.reauthenticate()` and resets the task to pending for automatic retry.
 
 Three task types (handlers in `linkedin/tasks/`, signature: `handle_*(task, session, qualifiers)`):
 
-1. **`handle_connect`** — Unified via `ConnectStrategy` dataclass. Regular: `find_candidate()` from `pools.py`; freemium: `find_freemium_candidate()`. Unreachable detection after `MAX_CONNECT_ATTEMPTS` (3).
+1. **`handle_connect`** — Unified via `ConnectStrategy` dataclass. Regular: `find_candidate()` from `pools.py`; freemium: `find_freemium_candidate()`. Unreachable detection after `MAX_CONNECT_ATTEMPTS` (3). Spread-delay scheduling via `compute_spread_delay()`: distributes requests across the active window (`remaining_active_seconds / remaining_daily_quota`). Post-connection delay uses the full interval (floored by `min_action_interval`); search-only retries use 25% of the interval. Freemium campaigns keep their own `action_fraction` scaling.
 2. **`handle_check_pending`** — Per-profile. Exponential backoff with jitter. On acceptance → enqueues `follow_up`.
 3. **`handle_follow_up`** — Per-profile. Calls `run_follow_up_agent()` which returns a `FollowUpDecision` (structured output: `send_message`/`mark_completed`/`wait`). Handler executes the decision deterministically.
 
@@ -75,7 +77,7 @@ Three apps in `INSTALLED_APPS`:
 ## CRM Data Model
 
 - **SiteConfig** (`linkedin/models.py`) — Singleton (pk=1). `llm_api_key`, `ai_model`, `llm_api_base`. Accessed via `SiteConfig.load()` / `conf.get_llm_config()`.
-- **Campaign** (`linkedin/models.py`) — `name` (unique), `users` (M2M to User), `product_docs`, `campaign_objective`, `booking_link`, `is_freemium`, `action_fraction`, `seed_public_ids` (JSONField).
+- **Campaign** (`linkedin/models.py`) — `name` (unique), `users` (M2M to User), `product_docs`, `campaign_objective`, `booking_link`, `is_freemium`, `action_fraction`, `seed_public_ids` (JSONField)., `active` (BooleanField, default True — toggle in Django Admin to enable/disable; `AccountSession.campaigns` filters by this).
 - **LinkedInProfile** (`linkedin/models.py`) — 1:1 with User. `self_lead` FK to Lead (nullable, set on first self-profile discovery). Credentials, rate limits (`connect_daily_limit`, `connect_weekly_limit`, `follow_up_daily_limit`). Methods: `can_execute`/`record_action`/`mark_exhausted`. In-memory `_exhausted` dict for daily rate limit caching.
 - **SearchKeyword** (`linkedin/models.py`) — FK to Campaign. `keyword`, `used`, `used_at`. Unique on `(campaign, keyword)`.
 - **ActionLog** (`linkedin/models.py`) — FK to LinkedInProfile + Campaign. `action_type` (connect/follow_up), `created_at`. Composite index on `(linkedin_profile, action_type, created_at)`.
@@ -101,7 +103,7 @@ Three apps in `INSTALLED_APPS`:
 - **`ml/embeddings.py`** — FastEmbed utilities, `embed_text()`, `embed_texts()`.
 - **`ml/profile_text.py`** — `build_profile_text()`.
 - **`ml/hub.py`** — HuggingFace kit loader (`fetch_kit()`).
-- **`browser/session.py`** — `AccountSession`: linkedin_profile, page, context, browser, playwright. `campaigns` cached_property (list, via Campaign.users M2M). `ensure_browser()` launches/recovers browser. `self_profile` cached_property (reads from `self_lead`, discovers via API on first run). Cookie expiry check via `_maybe_refresh_cookies()`. `reauthenticate()` forces fresh login (close browser, clear saved cookies, re-launch).
+- **`browser/session.py`** — `AccountSession`: linkedin_profile, page, context, browser, playwright. `campaigns` cached_property (list, via Campaign.users M2M). `ensure_browser()` launches/recovers browser. `self_profile` cached_property (reads from `self_lead`, discovers via API on first run). Cookie expiry check via `_maybe_refresh_cookies()`.
 - **`browser/registry.py`** — `get_or_create_session()`, `get_first_active_profile()`, `resolve_profile()`, `cli_parser()`/`cli_session()` (shared CLI bootstrap for `__main__` scripts).
 - **`browser/login.py`** — `start_browser_session()` — browser launch + LinkedIn login.
 - **`browser/nav.py`** — Navigation, auto-discovery, `goto_page()`.
@@ -109,7 +111,7 @@ Three apps in `INSTALLED_APPS`:
 - **`db/deals.py`** — Deal/state ops, `set_profile_state()`, `increment_connect_attempts()`, `create_freemium_deal()`.
 - **`db/chat.py`** — `save_chat_message()`.
 - **`url_utils.py`** — `url_to_public_id()`, `public_id_to_url()` — LinkedIn URL ↔ public identifier conversion. Pure utility, no DB dependency.
-- **`conf.py`** — Config constants, `CAMPAIGN_CONFIG`, `get_llm_config()` (reads from `SiteConfig` in DB).
+- **`conf.py`** — Config constants, `CAMPAIGN_CONFIG`, `get_llm_config()` (reads from `SiteConfig` in DB). Config loading (dotenv), `CAMPAIGN_CONFIG`, path constants. Timing constants (`MIN_DELAY`, `MAX_DELAY`, `ACTIVE_START_HOUR`, `ACTIVE_END_HOUR`, `ACTIVE_TIMEZONE`, `MIN_ACTION_INTERVAL`) are env-var configurable for per-worker anti-detection jitter.
 - **`exceptions.py`** — `AuthenticationError`, `TerminalStateError`, `SkipProfile`, `ReachedConnectionLimit`.
 - **`onboarding.py`** — Interactive setup.
 - **`agents/follow_up.py`** — Follow-up agent. Single LLM call with structured output (`FollowUpDecision`). Conversation is read in Python and injected into the prompt. No tool-calling loop.
@@ -126,20 +128,32 @@ Three apps in `INSTALLED_APPS`:
 - **`setup/seeds.py`** — User-provided seed profiles: parse URLs, create Leads + QUALIFIED Deals.
 - **`management/setup_crm.py`** — Idempotent CRM bootstrap (Site creation).
 - **`admin.py`** — Django Admin: SiteConfig, Campaign, LinkedInProfile, SearchKeyword, ActionLog, Task, ChatMessage.
-- **`django_settings.py`** — Django settings (SQLite at `data/db.sqlite3`). Apps: crm, chat, linkedin.
+- **`django_settings.py`** —  PostgreSQL by default (env vars: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`); SQLite fallback when `DB_ENGINE=django.db.backends.sqlite3`. Apps: crm, chat, linkedin. Django settings (SQLite at `data/db.sqlite3`). Apps: crm, chat, linkedin.
 - **`premigrations/`** — Pre-Django filesystem migrations. Numbered `NNNN_*.py` files with `forward(root_dir)` functions. Runner in `__init__.py` discovers and applies unapplied migrations, tracked via `data/.premigrations` JSON file.
 
 ## Configuration
 
-- **`SiteConfig`** (DB singleton) — `llm_api_key` (required), `ai_model` (required), `llm_api_base` (optional). Editable via Django Admin.
-- **`conf.py` schedule** — `ACTIVE_START_HOUR` (9), `ACTIVE_END_HOUR` (17), `ACTIVE_TIMEZONE` ("UTC"), `REST_DAYS` ((5, 6) = Sat+Sun). Daemon sleeps outside this window.
+- **`SiteConfig`** (DB singleton) — `llm_api_key` (required), `ai_model` (required), `llm_api_base` (optional). Editable via Django Admin. For Docker, pass via `docker run -e`.
+- **`conf.py` schedule** — `ACTIVE_START_HOUR` (9), `ACTIVE_END_HOUR` (17), `ACTIVE_TIMEZONE` ("UTC"), `REST_DAYS` ((5, 6) = Sat+Sun). All overridable via env vars for per-worker timing isolation. Daemon sleeps outside this window.
 - **`conf.py:CAMPAIGN_CONFIG`** — `min_ready_to_connect_prob` (0.9), `min_positive_pool_prob` (0.20), `connect_delay_seconds` (10), `connect_no_candidate_delay_seconds` (300), `check_pending_recheck_after_hours` (24), `check_pending_jitter_factor` (0.2), `qualification_n_mc_samples` (100), `enrich_min_interval` (1), `min_action_interval` (120), `embedding_model` ("BAAI/bge-small-en-v1.5").
 - **Prompt templates** (at `linkedin/templates/prompts/`) — `qualify_lead.j2` (temp 0.7), `search_keywords.j2` (temp 0.9), `follow_up_agent.j2`.
 - **`requirements/`** — `base.txt`, `local.txt`, `production.txt`, `crm.txt` (empty — DjangoCRM installed via `--no-deps`).
 
 ## Docker
 
-Base image: `mcr.microsoft.com/playwright/python:v1.55.0-noble`. VNC on port 5900. `BUILD_ENV` arg selects requirements. Dockerfile at `compose/linkedin/Dockerfile`. Install: uv pip → DjangoCRM `--no-deps` → requirements → Playwright chromium.
+Base image: `mcr.microsoft.com/playwright/python:v1.55.0-noble`. `BUILD_ENV` arg selects requirements. Dockerfile at `compose/linkedin/Dockerfile`. Install: uv pip → DjangoCRM `--no-deps` → requirements → Playwright chromium.
+
+### Multi-Account Setup (`local.yml`)
+
+Runs 4 LinkedIn accounts in parallel, each in its own container with full process isolation:
+
+- **`postgres`** — PostgreSQL 16, shared database for all services.
+- **`admin`** — Django Admin web server only (port 8000). `RUN_MODE=admin`.
+- **`worker-1` through `worker-4`** — One daemon per account. Each gets its own Xvfb display, browser, VNC (ports 5901-5904 / 6081-6084). `LINKEDIN_PROFILE` env var selects the Django username.
+
+Container entrypoint (`compose/linkedin/start`) dispatches based on `RUN_MODE`: `admin` runs `runserver`, `setup` runs interactive login, `browse` runs browser-only (no daemon), otherwise starts Xvfb/VNC + daemon with `--profile $LINKEDIN_PROFILE`.
+
+Each daemon's task queue is scoped to its own campaign IDs — no cross-account task claiming.
 
 ## CI/CD
 
@@ -150,5 +164,5 @@ Base image: `mcr.microsoft.com/playwright/python:v1.55.0-noble`. VNC on port 590
 
 `requirements/` files. DjangoCRM's `mysqlclient` excluded via `--no-deps`. `uv pip install` for fast installs.
 
-Core: `playwright`, `playwright-stealth`, `Django`, `django-crm-admin`, `pandas`, `langchain`/`langchain-openai`, `jinja2`, `pydantic`, `jsonpath-ng`, `tendo`, `termcolor`, `tenacity`
+Core: `playwright`, `playwright-stealth`, `Django`, `django-crm-admin`, `pandas`, `langchain`/`langchain-openai`, `jinja2`, `pydantic`, `jsonpath-ng`, `tendo`, `termcolor`, `tenacity`, `requests`
 ML: `scikit-learn`, `numpy`, `fastembed`, `joblib`

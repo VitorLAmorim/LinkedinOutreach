@@ -1,7 +1,52 @@
-# local.yml
+# local.yml — Multi-account setup
+#
+# Usage:
+#   1. Set LINKEDIN_PROFILE for each worker to the Django username of the account.
+#   2. docker compose -f local.yml up --build -d
+#   3. Django Admin: http://localhost:8000/admin/
+#   4. VNC per worker: ports 5901-5904 (x11vnc) / 6081-6084 (noVNC web)
+#
+# RUN_MODE values:
+#   daemon  (default) — full automation with browser
+#   browse  — browser + VNC only, no campaign automation (manual navigation)
+#   setup   — interactive VNC login, then exit
+#   admin   — Django Admin web server, no browser
 
 services:
-  app:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openoutreach
+      POSTGRES_USER: openoutreach
+      POSTGRES_PASSWORD: openoutreach
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5440:5432"
+
+  admin:
+    build:
+      context: .
+      dockerfile: ./compose/linkedin/Dockerfile
+      args:
+        - BUILD_ENV=local
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      RUN_MODE: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: openoutreach
+      POSTGRES_USER: openoutreach
+      POSTGRES_PASSWORD: openoutreach
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+
+  worker-1: &worker-base
     build:
       context: .
       dockerfile: ./compose/linkedin/Dockerfile
@@ -11,9 +56,60 @@ services:
     stdin_open: true
     tty: true
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    environment:
-      - ENABLE_VNC=true
+    depends_on:
+      - postgres
+    environment: &worker-env
+      LINKEDIN_PROFILE: vitor
+      #      RUN_MODE: browse
+      PROXY_URL: ""  # Unique residential proxy per account for production
+      # Per-worker timing (anti-detection — vary across workers):
+      MIN_DELAY: "15"
+      MAX_DELAY: "30"
+      ACTIVE_START_HOUR: "10"
+      ACTIVE_END_HOUR: "20"
+      MIN_ACTION_INTERVAL: "120"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: openoutreach
+      POSTGRES_USER: openoutreach
+      POSTGRES_PASSWORD: openoutreach
+      ENABLE_VNC: true
     volumes:
       - .:/app
     ports:
-      - "6080:6080"
+      - "5901:5900"
+      - "6081:6080"
+
+  worker-2:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      LINKEDIN_PROFILE: jorge
+      RUN_MODE: browse
+      PROXY_URL: ""  # Unique                                                            residential proxy per account for production
+    ports:
+      - "5902:5900"
+      - "6082:6080"
+
+#  worker-3:
+#    <<: *worker-base
+#    environment:
+#      <<: *worker-env
+#      LINKEDIN_PROFILE: samara
+#    ports:
+#      - "5903:5900"
+#      - "6083:6080"
+
+#  # Browse-only worker (manual navigation, no automation):
+#  worker-browse:
+#    <<: *worker-base
+#    environment:
+#      <<: *worker-env
+#      LINKEDIN_PROFILE: account4
+#      RUN_MODE: browse
+#    ports:
+#      - "5904:5900"
+#      - "6084:6080"
+
+volumes:
+  pgdata:

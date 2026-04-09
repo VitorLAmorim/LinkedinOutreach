@@ -13,7 +13,7 @@ from linkedin.models import ActionLog, Task
 from linkedin.ml.qualifier import BayesianQualifier
 from linkedin.enums import ProfileState
 from linkedin.exceptions import SkipProfile, ReachedConnectionLimit
-from linkedin.tasks.connect import ConnectStrategy, handle_connect
+from linkedin.tasks.connect import ConnectStrategy, compute_spread_delay, handle_connect
 from linkedin.tasks.check_pending import handle_check_pending
 from linkedin.tasks.follow_up import handle_follow_up
 
@@ -403,3 +403,103 @@ class TestHandleFollowUp:
             payload__public_id="alice",
         ).exclude(pk=task.pk).first()
         assert next_task is not None
+
+
+# ── compute_spread_delay tests ───��─────────────────────────────
+
+
+@pytest.mark.django_db
+class TestComputeSpreadDelay:
+    @pytest.fixture(autouse=True)
+    def _db(self, db):
+        pass
+
+    @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
+    def test_connected_uses_full_spread(self, _mock_remaining, fake_session):
+        profile = fake_session.linkedin_profile
+        profile.connect_daily_limit = 20
+        profile.save(update_fields=["connect_daily_limit"])
+
+        delay = compute_spread_delay(profile, connected=True)
+        # 36000 / 20 = 1800, with jitter 0.8-1.2 → 1440-2160
+        assert 1440 <= delay <= 2160
+
+    @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
+    def test_not_connected_uses_shorter_delay(self, _mock_remaining, fake_session):
+        profile = fake_session.linkedin_profile
+        profile.connect_daily_limit = 20
+        profile.save(update_fields=["connect_daily_limit"])
+
+        delay = compute_spread_delay(profile, connected=False)
+        # spread=1800, 25%=450 → capped at 300, with jitter → 240-360
+        assert 240 <= delay <= 360
+
+    @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
+    def test_respects_min_action_interval(self, _mock_remaining, fake_session):
+        profile = fake_session.linkedin_profile
+        # High limit + lots of time → small spread, but floored at min_action_interval (120s)
+        profile.connect_daily_limit = 500
+        profile.save(update_fields=["connect_daily_limit"])
+
+        delay = compute_spread_delay(profile, connected=True)
+        # 36000/500=72, floored to 120, with jitter → 96-144
+        assert 96 <= delay <= 144
+
+    @patch("linkedin.daemon.remaining_active_seconds", return_value=0.0)
+    def test_zero_remaining_returns_min_interval(self, _mock_remaining, fake_session):
+        profile = fake_session.linkedin_profile
+        delay = compute_spread_delay(profile, connected=True)
+        assert delay == 120.0
+
+    @patch("linkedin.daemon.remaining_active_seconds", return_value=2 * 3600)
+    def test_adapts_to_remaining_quota(self, _mock_remaining, fake_session):
+        profile = fake_session.linkedin_profile
+        profile.connect_daily_limit = 20
+        profile.save(update_fields=["connect_daily_limit"])
+
+        # Simulate 15 connections already made today
+        for _ in range(15):
+            profile.record_action(ActionLog.ActionType.CONNECT, fake_session.campaign)
+
+        delay = compute_spread_delay(profile, connected=True)
+        # 7200 / 5 = 1440, with jitter → 1152-1728
+        assert 1152 <= delay <= 1728
+
+
+@pytest.mark.django_db
+class TestHandleConnectSpreadDelay:
+    @pytest.fixture(autouse=True)
+    def _db(self, db):
+        pass
+
+    def _candidate(self):
+        return {"public_identifier": "alice", "url": "https://www.linkedin.com/in/alice/", "profile": SAMPLE_PROFILE}
+
+    @patch("linkedin.tasks.connect.compute_spread_delay", return_value=1800.0)
+    @patch("linkedin.tasks.connect.strategy_for")
+    @patch("linkedin.actions.search.visit_profile")
+    @patch("linkedin.actions.connect.send_connection_request")
+    @patch("linkedin.actions.status.get_connection_status")
+    def test_after_connect_uses_spread_delay(self, mock_status, mock_send, mock_visit, mock_strategy, mock_spread, fake_session):
+        _make_qualified(fake_session)
+        mock_strategy.return_value = _mock_strategy(self._candidate())
+        mock_status.return_value = ProfileState.QUALIFIED
+        mock_send.return_value = ProfileState.PENDING
+
+        task = _make_task(Task.TaskType.CONNECT, {"campaign_id": fake_session.campaign.pk})
+        qualifiers = _build_context(fake_session)
+        handle_connect(task, fake_session, qualifiers)
+
+        # compute_spread_delay should have been called with connected=True
+        mock_spread.assert_called_with(fake_session.linkedin_profile, connected=True)
+
+    @patch("linkedin.tasks.connect.compute_spread_delay", return_value=300.0)
+    @patch("linkedin.tasks.connect.strategy_for")
+    def test_no_candidate_uses_spread_delay_not_connected(self, mock_strategy, mock_spread, fake_session):
+        mock_strategy.return_value = _mock_strategy(None)
+
+        task = _make_task(Task.TaskType.CONNECT, {"campaign_id": fake_session.campaign.pk})
+        qualifiers = _build_context(fake_session)
+        handle_connect(task, fake_session, qualifiers)
+
+        mock_spread.assert_called_with(fake_session.linkedin_profile, connected=False)

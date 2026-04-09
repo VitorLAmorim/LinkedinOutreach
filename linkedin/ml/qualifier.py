@@ -44,11 +44,16 @@ class QualificationDecision(BaseModel):
     reason: str = Field(description="Brief explanation for the decision")
 
 
+_LLM_QUALIFY_RETRIES = 3
+
+
 def qualify_with_llm(profile_text: str, product_docs: str, campaign_objective: str) -> tuple[int, str]:
     """Call LLM to qualify a profile. Returns (label, reason).
 
     label: 1 = accept, 0 = reject.
     """
+    from pydantic import ValidationError as PydanticValidationError
+
     from langchain_openai import ChatOpenAI
 
     from linkedin.conf import get_llm_config
@@ -68,7 +73,15 @@ def qualify_with_llm(profile_text: str, product_docs: str, campaign_objective: s
 
     llm = ChatOpenAI(model=ai_model, temperature=0.7, api_key=llm_api_key, base_url=llm_api_base, timeout=60)
     structured_llm = llm.with_structured_output(QualificationDecision)
-    decision = structured_llm.invoke(prompt)
+
+    for attempt in range(_LLM_QUALIFY_RETRIES):
+        try:
+            decision = structured_llm.invoke(prompt)
+            break
+        except PydanticValidationError:
+            if attempt == _LLM_QUALIFY_RETRIES - 1:
+                raise
+            logger.warning("LLM returned invalid JSON (attempt %d/%d), retrying", attempt + 1, _LLM_QUALIFY_RETRIES)
 
     label = 1 if decision.qualified else 0
     return (label, decision.reason)

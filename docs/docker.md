@@ -77,17 +77,87 @@ HOST_UID=$(id -u) HOST_GID=$(id -g) make up
 | Command | Description |
 |:--------|:------------|
 | `make build` | Build the Docker image without starting |
-| `make up` | Build and start the service |
+| `make up` | Build and start all services (postgres + admin + 4 workers) |
 | `make stop` | Stop the running containers |
 | `make logs` | Follow application logs |
 | `make up-view` | Start + open VNC viewer (Linux, requires `vinagre`) |
-| `make view` | Open VNC viewer standalone (requires `vinagre`) |
+| `make view-1` … `make view-4` | Open VNC viewer for a specific worker |
 | `make docker-test` | Run the test suite in Docker |
 
 ### VNC with Docker Compose
 
-The VNC server is exposed on port 5900. Use `make up-view` to auto-open it, or connect manually to `localhost:5900` with any VNC client.
+Each worker exposes its own VNC port: worker-1 on 5901, worker-2 on 5902, etc. noVNC web access on 6081-6084. Use `make view-1` through `make view-4` to open them.
 
 ### Volume Mounts
 
-The pre-built `docker run` command uses a named Docker volume (`openoutreach_db`) mounted at `/app/data` for data persistence (database, config). The compose setup (`local.yml`) mounts the entire repo `.:/app` for live code editing during development.
+The pre-built `docker run` command uses a named Docker volume (`openoutreach_db`) mounted at `/app/data` for data persistence (database, config). The compose setup (`local.yml`) mounts the entire repo `.:/app` for live code editing during development. PostgreSQL data persists in the `pgdata` named volume.
+
+---
+
+## Multi-Account Setup (4 Campaigns, 4 Accounts)
+
+The `local.yml` compose file runs 4 LinkedIn accounts in parallel, each in its own isolated container with a separate browser process. All share a single PostgreSQL database.
+
+### Architecture
+
+| Service | Purpose | Ports |
+|:--------|:--------|:------|
+| `postgres` | Shared PostgreSQL database | 5432 |
+| `admin` | Django Admin web server | 8000 |
+| `worker-1` | Daemon for account 1 | VNC 5901, noVNC 6081 |
+| `worker-2` | Daemon for account 2 | VNC 5902, noVNC 6082 |
+| `worker-3` | Daemon for account 3 | VNC 5903, noVNC 6083 |
+| `worker-4` | Daemon for account 4 | VNC 5904, noVNC 6084 |
+
+### Setup Steps
+
+1. **Start the stack:**
+   ```bash
+   make up
+   ```
+
+2. **Create accounts via Django Admin** at `http://localhost:8000/admin/`:
+   - Create 4 Django users (usernames must match `LINKEDIN_PROFILE` env vars in `local.yml`)
+   - Create 4 LinkedInProfile records (one per user, all `active=True`)
+   - Create 4 Campaign records, each with its corresponding user in the M2M
+
+3. **Update `local.yml`** — set `LINKEDIN_PROFILE` for each worker to the Django username of its account:
+   ```yaml
+   worker-1:
+     environment:
+       LINKEDIN_PROFILE: john_doe
+   worker-2:
+     environment:
+       LINKEDIN_PROFILE: jane_smith
+   # ...
+   ```
+
+4. **Restart workers:**
+   ```bash
+   make stop && make up
+   ```
+
+### Data Migration from SQLite
+
+If you have existing data in `db.sqlite3`:
+
+```bash
+# Dump from SQLite
+DB_ENGINE=django.db.backends.sqlite3 python manage.py dumpdata --natural-foreign --natural-primary -o dump.json
+
+# Start postgres
+docker compose -f local.yml up -d postgres
+sleep 3
+
+# Load into PostgreSQL
+python manage.py migrate --no-input
+python manage.py loaddata dump.json
+```
+
+### How Isolation Works
+
+- **Process isolation**: Each worker is a separate container (PID, memory, network)
+- **Browser isolation**: Each worker has its own Xvfb display and Chromium instance
+- **Task queue isolation**: Each daemon only claims tasks for its own campaigns
+- **Rate limits**: Per-account (`LinkedInProfile.connect_daily_limit`, etc.)
+- **Shared data**: Leads are global (deduplicated by LinkedIn URL); Deals are campaign-scoped

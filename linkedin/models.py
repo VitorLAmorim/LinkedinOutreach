@@ -52,6 +52,7 @@ class Campaign(models.Model):
     action_fraction = models.FloatField(default=0.2)
     seed_public_ids = models.JSONField(default=list, blank=True)
     model_blob = models.BinaryField(null=True, blank=True)
+    active = models.BooleanField(default=True)
 
     def __str__(self):
         return self.name

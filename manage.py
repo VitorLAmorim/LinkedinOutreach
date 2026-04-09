@@ -2,11 +2,13 @@
 """Django management entrypoint.
 
 Usage:
-    python manage.py rundaemon                     # run the daemon (interactive onboarding)
-    python manage.py rundaemon --onboard config.json  # non-interactive onboarding
-    python manage.py runserver                     # Django Admin at http://localhost:8000/admin/
-    python manage.py migrate                       # run Django migrations
-    python manage.py createsuperuser
+    python manage.py rundaemon                       # run the daemon (interactive onboarding)
+    python manage.py rundaemon --profile <username>  # run the daemon for a specific account
+    python manage.py setup_account <username>        # interactive VNC login for account setup
+    python manage.py browse_account <username>       # browser + VNC, no automation
+    python manage.py onboard --config-file f.json    # non-interactive onboard
+    python manage.py runserver                       # Django Admin at http://localhost:8000/admin/
+    python manage.py migrate                         # run Django migrations
 """
 import os
 import sys

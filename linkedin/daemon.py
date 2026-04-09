@@ -118,6 +118,31 @@ def seconds_until_active() -> float:
     return (candidate - now).total_seconds()
 
 
+def remaining_active_seconds() -> float:
+    """Seconds remaining in the current active window.
+
+    Used by spread-delay logic to distribute connection requests evenly.
+    Returns 0 if outside the active window (shouldn't happen — daemon sleeps).
+    When active hours are disabled, returns min(seconds to midnight, default window).
+    """
+    if not ENABLE_ACTIVE_HOURS:
+        default_hours = CAMPAIGN_CONFIG["default_spread_window_hours"]
+        now = timezone.now()
+        midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        return min((midnight - now).total_seconds(), default_hours * 3600.0)
+
+    tz = ZoneInfo(ACTIVE_TIMEZONE)
+    now = timezone.localtime(timezone=tz)
+
+    if now.weekday() in REST_DAYS or now.hour >= ACTIVE_END_HOUR or now.hour < ACTIVE_START_HOUR:
+        return 0.0
+
+    end_today = now.replace(hour=ACTIVE_END_HOUR, minute=0, second=0, microsecond=0)
+    return (end_today - now).total_seconds()
+
+
 # ------------------------------------------------------------------
 # Task queue worker
 # ------------------------------------------------------------------
@@ -137,8 +162,12 @@ def heal_tasks(session):
 
     cfg = CAMPAIGN_CONFIG
 
-    # 1. Recover stale running tasks
-    stale_count = Task.objects.filter(status=Task.Status.RUNNING).update(
+    # 1. Recover stale running tasks (only for own campaigns)
+    campaign_ids = [c.pk for c in session.campaigns]
+    stale_count = Task.objects.filter(
+        status=Task.Status.RUNNING,
+        payload__campaign_id__in=campaign_ids,
+    ).update(
         status=Task.Status.PENDING,
     )
     if stale_count:
@@ -178,7 +207,8 @@ def heal_tasks(session):
                 continue
             enqueue_follow_up(campaign.pk, public_id, delay_seconds=random.uniform(5, 60))
 
-    pending_count = Task.objects.pending().count()
+    own_tasks = Task.objects.filter(payload__campaign_id__in=campaign_ids)
+    pending_count = own_tasks.pending().count()
     logger.info("Task queue healed: %d pending tasks", pending_count)
 
 
@@ -212,6 +242,9 @@ def run_daemon(session):
         logger.error("No campaigns found — cannot start daemon")
         return
 
+    campaign_ids = [c.pk for c in campaigns]
+    own_tasks = Task.objects.filter(payload__campaign_id__in=campaign_ids)
+
     logger.info(
         colored("Daemon started", "green", attrs=["bold"])
         + " — %d campaigns, task queue worker",
@@ -230,9 +263,9 @@ def run_daemon(session):
             time.sleep(pause)
             continue
 
-        task = Task.objects.claim_next()
+        task = own_tasks.claim_next()
         if task is None:
-            wait = Task.objects.seconds_to_next()
+            wait = own_tasks.seconds_to_next()
             if wait is None:
                 logger.info("Queue empty — nothing to do")
                 return

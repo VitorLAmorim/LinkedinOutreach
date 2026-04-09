@@ -13,7 +13,9 @@ SELECTORS = {
     "invite_to_connect": (
         '[aria-label*="Invite"][aria-label*="to connect"]:visible, '
         'a:has(span:text-is("Connect")):visible, '
-        'button:has(span:text-is("Connect")):visible'
+        'button:has(span:text-is("Connect")):visible, '
+        'a:has(span:text-is("Seguir")):visible, '
+        'button:has(span:text-is("Seguir")):visible'
     ),
     "error_toast": 'div[data-test-artdeco-toast-item-type="error"]',
     "more_button": (

@@ -50,6 +50,13 @@ class OnboardConfig:
     follow_up_daily_limit: int = DEFAULT_FOLLOW_UP_DAILY_LIMIT
     legal_acceptance: bool = False
 
+    @classmethod
+    def from_json(cls, path) -> "OnboardConfig":
+        """Load config from a JSON file, ignoring unknown keys."""
+        import json
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
 
 # ---------------------------------------------------------------------------
 # State inspection

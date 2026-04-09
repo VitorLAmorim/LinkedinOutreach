@@ -1,5 +1,6 @@
 # linkedin/browser/login.py
 import logging
+import time
 
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -54,7 +55,9 @@ def launch_browser(storage_state=None):
     logger.debug("Launching Playwright")
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=False, slow_mo=BROWSER_SLOW_MO)
-    context = browser.new_context(storage_state=storage_state)
+    from linkedin.conf import PROXY_URL
+    proxy = {"server": PROXY_URL} if PROXY_URL else None
+    context = browser.new_context(storage_state=storage_state, locale="en-US", proxy=proxy)
     context.set_default_timeout(BROWSER_DEFAULT_TIMEOUT_MS)
     Stealth().apply_stealth_sync(context)
     page = context.new_page()
@@ -95,6 +98,39 @@ def start_browser_session(session: "AccountSession"):
 
     session.page.wait_for_load_state("load")
     logger.info(colored("Browser ready", "green", attrs=["bold"]))
+
+
+_AUTH_COOKIE_NAME = "li_at"
+_SETUP_TIMEOUT_SECONDS = 15 * 60  # 15 minutes
+_SETUP_POLL_INTERVAL = 5  # seconds
+
+
+def interactive_setup(session):
+    """Launch browser for manual login via VNC. Polls for auth cookie, saves when found."""
+    page, context, browser, playwright = launch_browser()
+    session.page = page
+    session.context = context
+    session.browser = browser
+    session.playwright = playwright
+
+    page.goto(LINKEDIN_LOGIN_URL)
+    logger.info(
+        colored("Browser open at LinkedIn login", "cyan", attrs=["bold"])
+        + " — log in manually via VNC. Waiting for authentication..."
+    )
+
+    elapsed = 0
+    while elapsed < _SETUP_TIMEOUT_SECONDS:
+        time.sleep(_SETUP_POLL_INTERVAL)
+        elapsed += _SETUP_POLL_INTERVAL
+        cookies = context.cookies()
+        if any(c["name"] == _AUTH_COOKIE_NAME for c in cookies):
+            _save_cookies(session)
+            logger.info(colored("Authentication detected — session saved", "green", attrs=["bold"]))
+            return
+
+    logger.error("Timed out waiting for login (%d minutes)", _SETUP_TIMEOUT_SECONDS // 60)
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

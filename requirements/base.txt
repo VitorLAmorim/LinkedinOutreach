@@ -8,6 +8,7 @@ langchain-openai
 jinja2
 termcolor
 Django>=5.2,<7.0
+psycopg[binary]
 tendo
 pyyaml
 fastembed
