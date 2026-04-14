@@ -1,5 +1,5 @@
 # linkedin/onboarding.py
-"""Onboarding: create Campaign + LinkedInProfile + LLM config in DB.
+"""Onboarding: create Campaign + LinkedInAccount + LLM config in DB.
 
 Two ways to supply config:
 - OnboardConfig.from_json(path) — from a JSON file (non-interactive / cloud).
@@ -10,8 +10,8 @@ Both return an OnboardConfig; ``apply()`` is the single write path.
 from __future__ import annotations
 
 import logging
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from pathlib import Path
 
 from linkedin.conf import (
     DEFAULT_CONNECT_DAILY_LIMIT,
@@ -55,7 +55,8 @@ class OnboardConfig:
         """Load config from a JSON file, ignoring unknown keys."""
         import json
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
 
 
 # ---------------------------------------------------------------------------
@@ -77,14 +78,14 @@ _ALL_KEYS = _CAMPAIGN_KEYS | _ACCOUNT_KEYS | _LLM_KEYS
 
 def missing_keys() -> set[str]:
     """Return onboarding field keys that still need values."""
-    from linkedin.models import Campaign, LinkedInProfile, SiteConfig
+    from linkedin.models import Campaign, LinkedInAccount, SiteConfig
 
     keys: set[str] = set()
 
     if not Campaign.objects.exists():
         keys |= _CAMPAIGN_KEYS
 
-    if not LinkedInProfile.objects.filter(active=True).exists():
+    if not LinkedInAccount.objects.filter(active=True).exists():
         keys |= _ACCOUNT_KEYS
 
     cfg = SiteConfig.load()
@@ -119,10 +120,8 @@ def collect_from_wizard() -> OnboardConfig:
     if answers is None:
         raise SystemExit("Onboarding cancelled.")
 
-    return OnboardConfig(**{
-        k: v for k, v in answers.items()
-        if k in OnboardConfig.__dataclass_fields__
-    })
+    valid = {f.name for f in fields(OnboardConfig)}
+    return OnboardConfig(**{k: v for k, v in answers.items() if k in valid})
 
 
 # ---------------------------------------------------------------------------
@@ -133,23 +132,11 @@ def _read_default_file(path) -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def _create_campaign(name: str, product_docs: str, objective: str, booking_link: str = ""):
-    """Create a Campaign record and return it."""
-    from linkedin.models import Campaign
-
-    campaign = Campaign.objects.create(
-        name=name,
-        product_docs=product_docs,
-        campaign_objective=objective,
-        booking_link=booking_link,
-    )
-    logger.info("Created campaign: %s", name)
-    print(f"Campaign '{name}' created!")
-    return campaign
+def _email_to_handle(email: str) -> str:
+    return email.split("@")[0].lower().replace(".", "_").replace("+", "_")
 
 
 def _create_account(
-    campaign,
     email: str,
     password: str,
     *,
@@ -158,24 +145,12 @@ def _create_account(
     connect_weekly: int = DEFAULT_CONNECT_WEEKLY_LIMIT,
     follow_up_daily: int = DEFAULT_FOLLOW_UP_DAILY_LIMIT,
 ):
-    """Create a User + LinkedInProfile record and return the profile."""
-    from django.contrib.auth.models import User
-    from linkedin.models import LinkedInProfile
+    """Create a LinkedInAccount record and return it."""
+    from linkedin.models import LinkedInAccount
 
-    handle = email.split("@")[0].lower().replace(".", "_").replace("+", "_")
-
-    user, created = User.objects.get_or_create(
+    handle = _email_to_handle(email)
+    account = LinkedInAccount.objects.create(
         username=handle,
-        defaults={"is_staff": True, "is_active": True},
-    )
-    if created:
-        user.set_unusable_password()
-        user.save()
-
-    campaign.users.add(user)
-
-    profile = LinkedInProfile.objects.create(
-        user=user,
         linkedin_username=email,
         linkedin_password=password,
         subscribe_newsletter=subscribe,
@@ -183,10 +158,31 @@ def _create_account(
         connect_weekly_limit=connect_weekly,
         follow_up_daily_limit=follow_up_daily,
     )
-
-    logger.info("Created LinkedIn profile for %s (handle=%s)", email, handle)
+    logger.info("Created LinkedIn account for %s (handle=%s)", email, handle)
     print(f"Account '{handle}' created!")
-    return profile
+    return account
+
+
+def _create_campaign(
+    account,
+    name: str,
+    product_docs: str,
+    objective: str,
+    booking_link: str = "",
+):
+    """Create a Campaign bound to an account and return it."""
+    from linkedin.models import Campaign
+
+    campaign = Campaign.objects.create(
+        name=name,
+        account=account,
+        product_docs=product_docs,
+        campaign_objective=objective,
+        booking_link=booking_link,
+    )
+    logger.info("Created campaign: %s for account %s", name, account.username)
+    print(f"Campaign '{name}' created!")
+    return campaign
 
 
 def _create_seed_leads(campaign, seed_urls: str) -> None:
@@ -206,28 +202,14 @@ def _create_seed_leads(campaign, seed_urls: str) -> None:
 # ---------------------------------------------------------------------------
 
 def apply(config: OnboardConfig) -> None:
-    """Idempotent: create missing Campaign, Account, env vars, and legal acceptance."""
+    """Idempotent: create missing Account, Campaign, env vars, and legal acceptance."""
     from linkedin.management.setup_crm import DEFAULT_CAMPAIGN_NAME
-    from linkedin.models import Campaign, LinkedInProfile
+    from linkedin.models import Campaign, LinkedInAccount
 
-    # Campaign
-    campaign = Campaign.objects.first()
-    if campaign is None and config.campaign_name:
-        campaign = _create_campaign(
-            name=config.campaign_name or DEFAULT_CAMPAIGN_NAME,
-            product_docs=config.product_description or _read_default_file(DEFAULT_PRODUCT_DOCS),
-            objective=config.campaign_objective or _read_default_file(DEFAULT_CAMPAIGN_OBJECTIVE),
-            booking_link=config.booking_link,
-        )
-        _create_seed_leads(campaign, config.seed_urls)
-
-    # Account
-    if (
-        not LinkedInProfile.objects.filter(active=True).exists()
-        and config.linkedin_email
-    ):
-        _create_account(
-            campaign,
+    # Account first — campaigns now require an account FK
+    account = LinkedInAccount.objects.filter(active=True).first()
+    if account is None and config.linkedin_email:
+        account = _create_account(
             config.linkedin_email,
             config.linkedin_password,
             subscribe=config.newsletter,
@@ -235,6 +217,17 @@ def apply(config: OnboardConfig) -> None:
             connect_weekly=config.connect_weekly_limit,
             follow_up_daily=config.follow_up_daily_limit,
         )
+
+    # Campaign
+    if account is not None and not Campaign.objects.filter(account=account).exists() and config.campaign_name:
+        campaign = _create_campaign(
+            account,
+            name=config.campaign_name or DEFAULT_CAMPAIGN_NAME,
+            product_docs=config.product_description or _read_default_file(DEFAULT_PRODUCT_DOCS),
+            objective=config.campaign_objective or _read_default_file(DEFAULT_CAMPAIGN_OBJECTIVE),
+            booking_link=config.booking_link,
+        )
+        _create_seed_leads(campaign, config.seed_urls)
 
     # LLM config → DB
     from linkedin.models import SiteConfig
@@ -254,5 +247,4 @@ def apply(config: OnboardConfig) -> None:
 
     # Legal
     if config.legal_acceptance:
-        from linkedin.models import LinkedInProfile as LP
-        LP.objects.filter(legal_accepted=False, active=True).update(legal_accepted=True)
+        LinkedInAccount.objects.filter(legal_accepted=False, active=True).update(legal_accepted=True)

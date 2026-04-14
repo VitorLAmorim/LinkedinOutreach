@@ -1,4 +1,3 @@
-# linkedin/setup/freemium.py
 """Freemium campaign creation from kit config."""
 from __future__ import annotations
 
@@ -7,19 +6,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def import_freemium_campaign(kit_config: dict):
-    """Create or update a freemium Campaign from kit config.
+def import_freemium_campaign(account, kit_config: dict):
+    """Create or update a freemium Campaign for the given LinkedInAccount.
 
-    Adds all active users to the campaign.
-    Returns the Campaign instance or None.
+    Returns the Campaign instance.
     """
-    from linkedin.models import Campaign, LinkedInProfile
+    from linkedin.models import Campaign
 
-    campaign_name = kit_config.get("campaign_name", "Freemium Outreach")
+    campaign_name = f"{kit_config.get('campaign_name', 'Freemium Outreach')} ({account.username})"
 
     campaign, _ = Campaign.objects.update_or_create(
         name=campaign_name,
         defaults={
+            "account": account,
             "product_docs": kit_config["product_docs"],
             "campaign_objective": kit_config["campaign_objective"],
             "booking_link": kit_config["booking_link"],
@@ -28,12 +27,10 @@ def import_freemium_campaign(kit_config: dict):
         },
     )
 
-    # Add all active LinkedIn users to this campaign
-    for lp in LinkedInProfile.objects.filter(active=True).select_related("user"):
-        campaign.users.add(lp.user)
-
-    logger.info("[Freemium] Campaign imported: %s (action_fraction=%.2f)",
-               campaign_name, kit_config["action_fraction"])
+    logger.info(
+        "[Freemium] Campaign imported: %s (action_fraction=%.2f)",
+        campaign_name, kit_config["action_fraction"],
+    )
     return campaign
 
 

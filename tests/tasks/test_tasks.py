@@ -54,12 +54,12 @@ def _make_qualified(session, public_id="alice"):
 
 def _make_pending(session, public_id="alice"):
     _make_qualified(session, public_id)
-    set_profile_state(session, public_id, ProfileState.PENDING.value)
+    set_profile_state(session, public_id, ProfileState.PENDING)
 
 
 def _make_connected(session, public_id="alice"):
     _make_qualified(session, public_id)
-    set_profile_state(session, public_id, ProfileState.CONNECTED.value)
+    set_profile_state(session, public_id, ProfileState.CONNECTED)
 
 
 def _make_old_deal(session, days):
@@ -168,7 +168,7 @@ class TestHandleConnect:
         qualifiers = _build_context(fake_session)
         handle_connect(task, fake_session, qualifiers)
 
-        assert ActionLog.ActionType.CONNECT in fake_session.linkedin_profile._exhausted
+        assert ActionLog.ActionType.CONNECT in fake_session.account._exhausted
 
     @patch("linkedin.tasks.connect.strategy_for")
     @patch("linkedin.actions.search.visit_profile")
@@ -255,7 +255,6 @@ class TestHandleCheckPending:
 
     @patch("linkedin.actions.status.get_connection_status")
     def test_stays_pending_and_doubles_backoff(self, mock_status, fake_session):
-        import json
         mock_status.return_value = ProfileState.PENDING
         _make_pending(fake_session)
 
@@ -386,8 +385,8 @@ class TestHandleFollowUp:
 
     def test_reschedules_on_rate_limit(self, fake_session):
         _make_connected(fake_session)
-        fake_session.linkedin_profile.follow_up_daily_limit = 0
-        fake_session.linkedin_profile.save(update_fields=["follow_up_daily_limit"])
+        fake_session.account.follow_up_daily_limit = 0
+        fake_session.account.save(update_fields=["follow_up_daily_limit"])
 
         task = _make_task(
             Task.TaskType.FOLLOW_UP,
@@ -416,7 +415,7 @@ class TestComputeSpreadDelay:
 
     @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
     def test_connected_uses_full_spread(self, _mock_remaining, fake_session):
-        profile = fake_session.linkedin_profile
+        profile = fake_session.account
         profile.connect_daily_limit = 20
         profile.save(update_fields=["connect_daily_limit"])
 
@@ -426,7 +425,7 @@ class TestComputeSpreadDelay:
 
     @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
     def test_not_connected_uses_shorter_delay(self, _mock_remaining, fake_session):
-        profile = fake_session.linkedin_profile
+        profile = fake_session.account
         profile.connect_daily_limit = 20
         profile.save(update_fields=["connect_daily_limit"])
 
@@ -436,7 +435,7 @@ class TestComputeSpreadDelay:
 
     @patch("linkedin.daemon.remaining_active_seconds", return_value=10 * 3600)
     def test_respects_min_action_interval(self, _mock_remaining, fake_session):
-        profile = fake_session.linkedin_profile
+        profile = fake_session.account
         # High limit + lots of time → small spread, but floored at min_action_interval (120s)
         profile.connect_daily_limit = 500
         profile.save(update_fields=["connect_daily_limit"])
@@ -447,13 +446,13 @@ class TestComputeSpreadDelay:
 
     @patch("linkedin.daemon.remaining_active_seconds", return_value=0.0)
     def test_zero_remaining_returns_min_interval(self, _mock_remaining, fake_session):
-        profile = fake_session.linkedin_profile
+        profile = fake_session.account
         delay = compute_spread_delay(profile, connected=True)
         assert delay == 120.0
 
     @patch("linkedin.daemon.remaining_active_seconds", return_value=2 * 3600)
     def test_adapts_to_remaining_quota(self, _mock_remaining, fake_session):
-        profile = fake_session.linkedin_profile
+        profile = fake_session.account
         profile.connect_daily_limit = 20
         profile.save(update_fields=["connect_daily_limit"])
 
@@ -491,7 +490,7 @@ class TestHandleConnectSpreadDelay:
         handle_connect(task, fake_session, qualifiers)
 
         # compute_spread_delay should have been called with connected=True
-        mock_spread.assert_called_with(fake_session.linkedin_profile, connected=True)
+        mock_spread.assert_called_with(fake_session.account, connected=True)
 
     @patch("linkedin.tasks.connect.compute_spread_delay", return_value=300.0)
     @patch("linkedin.tasks.connect.strategy_for")
@@ -502,4 +501,4 @@ class TestHandleConnectSpreadDelay:
         qualifiers = _build_context(fake_session)
         handle_connect(task, fake_session, qualifiers)
 
-        mock_spread.assert_called_with(fake_session.linkedin_profile, connected=False)
+        mock_spread.assert_called_with(fake_session.account, connected=False)

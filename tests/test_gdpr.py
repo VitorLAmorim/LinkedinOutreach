@@ -74,26 +74,26 @@ def test_all_eu_members_present():
 
 
 def _make_fake_session(subscribe=None):
-    """Create a fake session with a linkedin_profile mock."""
+    """Create a fake session with a account mock."""
     session = MagicMock()
-    session.linkedin_profile.subscribe_newsletter = subscribe
+    session.account.subscribe_newsletter = subscribe
     return session
 
 
 def test_override_non_gdpr_sets_true():
     session = _make_fake_session(subscribe=None)
     apply_gdpr_newsletter_override(session, "us")
-    assert session.linkedin_profile.subscribe_newsletter is True
-    session.linkedin_profile.save.assert_called_once()
+    assert session.account.subscribe_newsletter is True
+    session.account.save.assert_called_once()
 
 
 def test_override_gdpr_respects_existing_config():
     session = _make_fake_session(subscribe=False)
     apply_gdpr_newsletter_override(session, "de")
-    assert session.linkedin_profile.subscribe_newsletter is False
+    assert session.account.subscribe_newsletter is False
 
 
 def test_override_missing_code_respects_existing_config():
     session = _make_fake_session(subscribe=False)
     apply_gdpr_newsletter_override(session, None)
-    assert session.linkedin_profile.subscribe_newsletter is False
+    assert session.account.subscribe_newsletter is False

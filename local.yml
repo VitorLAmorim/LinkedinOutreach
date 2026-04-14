@@ -1,16 +1,53 @@
 # local.yml — Multi-account setup
 #
 # Usage:
-#   1. Set LINKEDIN_PROFILE for each worker to the Django username of the account.
-#   2. docker compose -f local.yml up --build -d
-#   3. Django Admin: http://localhost:8000/admin/
-#   4. VNC per worker: ports 5901-5904 (x11vnc) / 6081-6084 (noVNC web)
+#   Pool mode (recommended for production):
+#     docker compose -f local.yml up -d --scale worker-pool=4
+#     Each replica claims any eligible account dynamically.
+#
+#   Pinned mode (local debugging only):
+#     Uncomment worker-1 / worker-2 and set LINKEDIN_PROFILE to a Django username.
+#     Named workers get fixed VNC ports (5901-5904 / 6081-6084).
+#
+#   Django Admin: http://localhost:8000/admin/
 #
 # RUN_MODE values:
 #   daemon  (default) — full automation with browser
 #   browse  — browser + VNC only, no campaign automation (manual navigation)
 #   setup   — interactive VNC login, then exit
 #   admin   — Django Admin web server, no browser
+
+x-worker-base: &worker-base
+  build:
+    context: .
+    dockerfile: ./compose/linkedin/Dockerfile
+    args:
+      - BUILD_ENV=local
+  restart: unless-stopped
+  stdin_open: true
+  tty: true
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  depends_on:
+    - postgres
+  volumes:
+    - .:/app
+
+x-worker-env: &worker-env
+  PROXY_URL: "" # Set per-account via LinkedInAccount.proxy_url (PATCH /api/accounts/<id>/). Use unique residential proxies in production.
+  WEBHOOK_URL: ${WEBHOOK_URL:-}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+  # Per-worker timing (anti-detection — vary across workers):
+  MIN_DELAY: "15"
+  MAX_DELAY: "30"
+  ACTIVE_START_HOUR: "10"
+  ACTIVE_END_HOUR: "20"
+  MIN_ACTION_INTERVAL: "120"
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: openoutreach
+  POSTGRES_USER: openoutreach
+  POSTGRES_PASSWORD: openoutreach
+  ENABLE_VNC: true
 
 services:
   postgres:
@@ -41,64 +78,52 @@ services:
       POSTGRES_DB: openoutreach
       POSTGRES_USER: openoutreach
       POSTGRES_PASSWORD: openoutreach
+      API_KEY: ${API_KEY:?API_KEY must be set in .env}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
     volumes:
       - .:/app
     ports:
       - "8000:8000"
 
-  worker-1: &worker-base
-    build:
-      context: .
-      dockerfile: ./compose/linkedin/Dockerfile
-      args:
-        - BUILD_ENV=local
-    restart: unless-stopped
-    stdin_open: true
-    tty: true
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    depends_on:
-      - postgres
-    environment: &worker-env
-      LINKEDIN_PROFILE: vitor
-      #      RUN_MODE: browse
-      PROXY_URL: ""  # Unique residential proxy per account for production
-      # Per-worker timing (anti-detection — vary across workers):
-      MIN_DELAY: "15"
-      MAX_DELAY: "30"
-      ACTIVE_START_HOUR: "10"
-      ACTIVE_END_HOUR: "20"
-      MIN_ACTION_INTERVAL: "120"
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: openoutreach
-      POSTGRES_USER: openoutreach
-      POSTGRES_PASSWORD: openoutreach
-      ENABLE_VNC: true
-    volumes:
-      - .:/app
-    ports:
-      - "5901:5900"
-      - "6081:6080"
-
-  worker-2:
+  # Pool-mode worker — no LINKEDIN_PROFILE, dynamically claims an eligible account.
+  # Scale with: docker compose -f local.yml up -d --scale worker-pool=4
+  # Each replica claims a different active account; if an account's campaign is
+  # deactivated, the worker releases it and claims the next eligible one at runtime.
+  # Per-account proxy comes from LinkedInAccount.proxy_url (PATCH /api/accounts/<id>/).
+  # VNC: ephemeral host ports — find them with:
+  #   docker compose -f local.yml port --index N worker-pool 6080
+  worker-pool:
     <<: *worker-base
     environment:
       <<: *worker-env
-      LINKEDIN_PROFILE: jorge
-      RUN_MODE: browse
-      PROXY_URL: ""  # Unique                                                            residential proxy per account for production
+      LINKEDIN_PROFILE: ""
     ports:
-      - "5902:5900"
-      - "6082:6080"
+      - "5900"   # VNC
+      - "6080"   # noVNC
 
-#  worker-3:
+  # ---------------------------------------------------------------------------
+  # Pinned workers — local/debug only. Uncomment to attach a named worker to a
+  # specific account with a fixed VNC port. Comment out for production pool use.
+  # ---------------------------------------------------------------------------
+
+#  worker-1:
 #    <<: *worker-base
 #    environment:
 #      <<: *worker-env
-#      LINKEDIN_PROFILE: samara
+#      LINKEDIN_PROFILE: vitor
 #    ports:
-#      - "5903:5900"
-#      - "6083:6080"
+#      - "5901:5900"
+#      - "6081:6080"
+
+#  worker-2:
+#    <<: *worker-base
+#    environment:
+#      <<: *worker-env
+#      LINKEDIN_PROFILE: yulialialkova
+#    ports:
+#      - "5902:5900"
+#      - "6082:6080"
 
 #  # Browse-only worker (manual navigation, no automation):
 #  worker-browse:

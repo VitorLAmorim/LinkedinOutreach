@@ -42,7 +42,7 @@ def discover_self_profile(session) -> dict:
     )
     logger.info("Self-profile discovered: %s", real_url)
 
-    session.linkedin_profile.self_lead = lead
-    session.linkedin_profile.save(update_fields=["self_lead"])
+    session.account.self_lead = lead
+    session.account.save(update_fields=["self_lead"])
 
     return profile

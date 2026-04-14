@@ -2,38 +2,40 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from linkedin.browser.session import AccountSession
 
 logger = logging.getLogger(__name__)
 
-_sessions: dict[int, "AccountSession"] = {}
+_sessions: dict[int, AccountSession] = {}
 
 
-def get_or_create_session(linkedin_profile) -> "AccountSession":
+def get_or_create_session(account) -> AccountSession:
     from linkedin.browser.session import AccountSession
 
-    pk = linkedin_profile.pk
+    pk = account.pk
     if pk not in _sessions:
-        _sessions[pk] = AccountSession(linkedin_profile)
-        logger.debug("Created new account session for %s", linkedin_profile)
+        _sessions[pk] = AccountSession(account)
+        logger.debug("Created new account session for %s", account)
     return _sessions[pk]
 
 
-def get_first_active_profile():
-    """Return the first active LinkedInProfile, or None."""
-    from linkedin.models import LinkedInProfile
+def get_first_active_account():
+    """Return the first active LinkedInAccount, or None."""
+    from linkedin.models import LinkedInAccount
 
-    return LinkedInProfile.objects.filter(active=True).select_related("user").first()
+    return LinkedInAccount.objects.filter(active=True, is_archived=False).first()
 
 
-def resolve_profile(username: str | None = None):
-    """Resolve a LinkedInProfile from an optional username, falling back to first active."""
+def resolve_account(username: str | None = None):
+    """Resolve a LinkedInAccount from an optional username, falling back to first active."""
     if username:
-        from linkedin.models import LinkedInProfile
+        from linkedin.models import LinkedInAccount
 
-        return LinkedInProfile.objects.select_related("user").filter(
-            user__username=username,
-        ).first()
-    return get_first_active_profile()
+        return LinkedInAccount.objects.filter(username=username).first()
+    return get_first_active_account()
 
 
 def cli_parser(description: str):
@@ -55,20 +57,20 @@ def cli_parser(description: str):
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--handle", default=None, help="Django username (default: first active profile)")
+    parser.add_argument("--handle", default=None, help="LinkedInAccount username (default: first active account)")
     return parser
 
 
-def cli_session(args) -> "AccountSession":
-    """Resolve profile from parsed args, create session, set default campaign."""
-    linkedin_profile = resolve_profile(args.handle)
-    if not linkedin_profile:
-        print("No active LinkedInProfile found.")
+def cli_session(args) -> AccountSession:
+    """Resolve account from parsed args, create session, set default campaign."""
+    account = resolve_account(args.handle)
+    if not account:
+        print("No active LinkedInAccount found.")
         raise SystemExit(1)
 
-    session = get_or_create_session(linkedin_profile)
+    session = get_or_create_session(account)
     if not session.campaigns:
-        print(f"No campaigns found for {linkedin_profile}.")
+        print(f"No campaigns found for {account}.")
         raise SystemExit(1)
     session.campaign = session.campaigns[0]
     return session

@@ -63,13 +63,13 @@ def subscribe_to_newsletter(email: str, linkedin: str | None = None) -> bool:
 
 def ensure_newsletter_subscription(session: AccountSession, linkedin_url: str | None = None):
     """Subscribe the account to the OpenOutreach newsletter if enabled."""
-    lp = session.linkedin_profile
+    account = session.account
 
-    if not lp.subscribe_newsletter:
+    if not account.subscribe_newsletter:
         logger.debug("Newsletter disabled for %s", session)
         return
 
-    email = lp.linkedin_username
+    email = account.linkedin_username
     if not email or "@" not in str(email):
         logger.warning("No valid email for newsletter: %s", session)
         return

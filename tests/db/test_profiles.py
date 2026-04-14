@@ -225,7 +225,7 @@ class TestSetProfileState:
             SAMPLE_PROFILE,
         )
         promote_lead_to_deal(fake_session, "alice")
-        set_profile_state(fake_session, "alice", ProfileState.PENDING.value)
+        set_profile_state(fake_session, "alice", ProfileState.PENDING)
         deal = Deal.objects.get(lead__linkedin_url="https://www.linkedin.com/in/alice/")
         assert deal.state == ProfileState.PENDING
 
@@ -236,7 +236,7 @@ class TestSetProfileState:
             SAMPLE_PROFILE,
         )
         with pytest.raises(ValueError, match="No Deal"):
-            set_profile_state(fake_session, "alice", ProfileState.QUALIFIED.value)
+            set_profile_state(fake_session, "alice", ProfileState.QUALIFIED)
 
 
 # ── get_qualified_profiles (Deals at "Qualified" state) ──
@@ -256,7 +256,7 @@ class TestGetQualifiedProfiles:
 
     def test_excludes_other_states(self, fake_session):
         self._promote(fake_session)
-        set_profile_state(fake_session, "alice", ProfileState.PENDING.value)
+        set_profile_state(fake_session, "alice", ProfileState.PENDING)
         profiles = get_qualified_profiles(fake_session)
         assert len(profiles) == 0
 
@@ -266,7 +266,7 @@ class TestGetQualifiedProfiles:
 @pytest.mark.django_db
 class TestCreateDisqualifiedDeal:
     def test_creates_failed_deal(self, fake_session):
-        from crm.models import Deal, ClosingReason
+        from crm.models import ClosingReason
         create_enriched_lead(
             fake_session,
             "https://www.linkedin.com/in/alice/",
@@ -309,13 +309,8 @@ class TestMultiCampaignQualification:
         from linkedin.models import Campaign
         from tests.conftest import FakeAccountSession
 
-        campaign2 = Campaign.objects.create(name="Other Campaign")
-        campaign2.users.add(fake_session.django_user)
-        return FakeAccountSession(
-            django_user=fake_session.django_user,
-            linkedin_profile=fake_session.linkedin_profile,
-            campaign=campaign2,
-        )
+        campaign2 = Campaign.objects.create(name="Other Campaign", account=fake_session.account)
+        return FakeAccountSession(account=fake_session.account, campaign=campaign2)
 
     def test_disqualified_in_other_campaign_still_eligible(self, fake_session):
         """A lead rejected by campaign A is still eligible for campaign B."""

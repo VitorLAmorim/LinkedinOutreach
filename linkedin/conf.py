@@ -79,3 +79,11 @@ def get_llm_config():
 
 PROXY_URL = os.getenv("PROXY_URL")
 
+# ----------------------------------------------------------------------
+# REST API & Webhooks
+# ----------------------------------------------------------------------
+API_KEY = os.getenv("API_KEY", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+CHECK_INBOX_INTERVAL_SECONDS = int(os.getenv("CHECK_INBOX_INTERVAL_SECONDS", "300"))
+

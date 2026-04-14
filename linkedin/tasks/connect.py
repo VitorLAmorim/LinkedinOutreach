@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from django.utils import timezone
 from termcolor import colored
@@ -31,7 +31,7 @@ class ConnectStrategy:
     pre_connect: Callable | None
     delay: float
     action_fraction: float  # 1.0 = always fire at base delay
-    qualifier: object
+    qualifier: Any
 
     def compute_delay(self, elapsed: float) -> float:
         """Delay until next connect, scaled by elapsed execution time for freemium campaigns."""
@@ -68,7 +68,7 @@ def strategy_for(campaign, qualifiers):
     )
 
 
-def compute_spread_delay(linkedin_profile, connected: bool) -> float:
+def compute_spread_delay(account, connected: bool) -> float:
     """Delay to spread connection requests evenly across the active window.
 
     connected=True (after sending a request): full spread interval.
@@ -80,8 +80,8 @@ def compute_spread_delay(linkedin_profile, connected: bool) -> float:
     cfg = CAMPAIGN_CONFIG
     min_interval = cfg["min_action_interval"]
 
-    daily_limit = linkedin_profile.connect_daily_limit or 20
-    used_today = linkedin_profile._daily_count(ActionLog.ActionType.CONNECT)
+    daily_limit = account.connect_daily_limit or 20
+    used_today = account._daily_count(ActionLog.ActionType.CONNECT)
     remaining_quota = max(daily_limit - used_today, 1)
 
     remaining_secs = remaining_active_seconds()
@@ -126,11 +126,11 @@ def handle_connect(task, session, qualifiers):
             elapsed = (timezone.now() - task.started_at).total_seconds() if task.started_at else 0
             enqueue_connect(campaign_id, delay_seconds=strategy.compute_delay(elapsed))
         else:
-            delay = compute_spread_delay(session.linkedin_profile, connected=connected)
+            delay = compute_spread_delay(session.account, connected=connected)
             enqueue_connect(campaign_id, delay_seconds=delay)
 
     # --- Rate limit check ---
-    if not session.linkedin_profile.can_execute(ActionLog.ActionType.CONNECT):
+    if not session.account.can_execute(ActionLog.ActionType.CONNECT):
         enqueue_connect(campaign_id, delay_seconds=_seconds_until_tomorrow())
         return
 
@@ -165,13 +165,13 @@ def handle_connect(task, session, qualifiers):
         status = get_connection_status(session, profile)
 
         if status == ProfileState.CONNECTED:
-            set_profile_state(session, public_id, status.value)
+            set_profile_state(session, public_id, status)
             enqueue_follow_up(campaign_id, public_id)
             _reschedule(connected=False)
             return
 
         if status == ProfileState.PENDING:
-            set_profile_state(session, public_id, status.value)
+            set_profile_state(session, public_id, status)
             enqueue_check_pending(
                 campaign_id, public_id,
                 backoff_hours=cfg["check_pending_recheck_after_hours"],
@@ -188,15 +188,15 @@ def handle_connect(task, session, qualifiers):
             if attempts >= MAX_CONNECT_ATTEMPTS:
                 reason = f"Unreachable: no Connect button after {attempts} attempts"
                 disqualify_lead(public_id)
-                set_profile_state(session, public_id, ProfileState.FAILED.value, reason=reason)
+                set_profile_state(session, public_id, ProfileState.FAILED, reason=reason)
                 logger.warning("Disqualified %s — %s", public_id, reason)
             else:
-                set_profile_state(session, public_id, new_state.value)
+                set_profile_state(session, public_id, new_state)
                 logger.debug("%s: connect attempt %d/%d — no button found", public_id, attempts, MAX_CONNECT_ATTEMPTS)
         else:
             connection_sent = True
-            set_profile_state(session, public_id, new_state.value)
-            session.linkedin_profile.record_action(
+            set_profile_state(session, public_id, new_state)
+            session.account.record_action(
                 ActionLog.ActionType.CONNECT, session.campaign,
             )
 
@@ -210,12 +210,12 @@ def handle_connect(task, session, qualifiers):
 
     except ReachedConnectionLimit as e:
         logger.warning("Rate limited: %s", e)
-        session.linkedin_profile.mark_exhausted(ActionLog.ActionType.CONNECT)
+        session.account.mark_exhausted(ActionLog.ActionType.CONNECT)
         enqueue_connect(campaign_id, delay_seconds=_seconds_until_tomorrow())
         return
     except SkipProfile as e:
         logger.warning("Skipping %s: %s", public_id, e)
-        set_profile_state(session, public_id, ProfileState.FAILED.value)
+        set_profile_state(session, public_id, ProfileState.FAILED)
 
     _reschedule(connected=connection_sent)
 

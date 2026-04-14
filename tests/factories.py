@@ -1,18 +1,18 @@
 # tests/factories.py
 import factory
-from django.contrib.auth.models import User
 from faker import Faker
 
 fake = Faker()
 
 
-class UserFactory(factory.django.DjangoModelFactory):
+class LinkedInAccountFactory(factory.django.DjangoModelFactory):
     class Meta:
-        model = User
+        model = "linkedin.LinkedInAccount"
 
     username = factory.LazyFunction(fake.user_name)
-    is_staff = True
-    is_active = True
+    linkedin_username = factory.LazyFunction(lambda: fake.email())
+    linkedin_password = factory.LazyFunction(lambda: fake.password())
+    active = True
 
 
 class LeadFactory(factory.django.DjangoModelFactory):

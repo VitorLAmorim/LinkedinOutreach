@@ -5,7 +5,7 @@ class Command(BaseCommand):
     help = (
         "Delete all Leads, Deals, "
         "ActionLogs, reset SearchKeywords, and clear GP model blobs. "
-        "Keeps Campaigns and LinkedInProfiles."
+        "Keeps Campaigns and LinkedInAccounts."
     )
 
     def add_arguments(self, parser):

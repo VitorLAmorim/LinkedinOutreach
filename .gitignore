@@ -5,6 +5,7 @@ __pycache__/
 .vscode
 .dockerignore
 .env
+.mcp.json
 
 /linkedin_state.json
 /.coverage

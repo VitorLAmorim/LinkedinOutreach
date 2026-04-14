@@ -62,7 +62,6 @@ def _sync_from_api(session, public_identifier: str, lead, ct):
 
         is_outgoing = parsed["sender_host_urn"] == self_urn
 
-        # Upsert by linkedin_urn
         _, created = ChatMessage.objects.update_or_create(
             linkedin_urn=parsed["entityUrn"],
             defaults={
@@ -70,7 +69,6 @@ def _sync_from_api(session, public_identifier: str, lead, ct):
                 "object_id": lead.pk,
                 "content": parsed["text"],
                 "is_outgoing": is_outgoing,
-                "owner": session.django_user,
                 **({"creation_date": parsed["delivered_at"]} if parsed["delivered_at"] else {}),
             },
         )
@@ -89,19 +87,15 @@ def _read_from_db(public_identifier: str) -> list[dict]:
 
     messages = ChatMessage.objects.filter(
         content_type=ct, object_id=lead.pk,
-    ).select_related("owner").order_by("creation_date")
+    ).order_by("creation_date")
 
     result = []
     for msg in messages:
         if not msg.content:
             continue
-        if msg.is_outgoing:
-            owner = msg.owner
-            sender = f"{owner.first_name or ''} {owner.last_name or ''}".strip() if owner else "me"
-        else:
-            sender = lead_name
+        sender = "me" if msg.is_outgoing else lead_name
         result.append({
-            "sender": sender or "me",
+            "sender": sender,
             "text": msg.content,
             "timestamp": msg.creation_date.strftime("%Y-%m-%d %H:%M") if msg.creation_date else "",
             "is_outgoing": msg.is_outgoing,

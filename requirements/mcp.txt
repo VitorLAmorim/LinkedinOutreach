@@ -1,0 +1,5 @@
+# MCP server (mcp_server/) — thin code-mode wrapper over the REST API.
+# Standalone: does NOT depend on Django or playwright.
+mcp[cli]>=1.2.0
+httpx>=0.27
+pydantic>=2.0

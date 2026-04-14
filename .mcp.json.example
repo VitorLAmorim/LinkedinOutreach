@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "openoutreach": {
+      "command": "/absolute/path/to/OpenOutreach/.venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/absolute/path/to/OpenOutreach",
+      "env": {
+        "OPENOUTREACH_BASE_URL": "http://localhost:8000",
+        "OPENOUTREACH_API_KEY": "<paste API_KEY from .env>"
+      }
+    }
+  }
+}

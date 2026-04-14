@@ -29,7 +29,7 @@ def handle_follow_up(task, session, qualifiers):
     )
 
     # Rate limit check
-    if not session.linkedin_profile.can_execute(ActionLog.ActionType.FOLLOW_UP):
+    if not session.account.can_execute(ActionLog.ActionType.FOLLOW_UP):
         enqueue_follow_up(campaign_id, public_id, delay_seconds=3600)
         return
 
@@ -46,16 +46,16 @@ def handle_follow_up(task, session, qualifiers):
         logger.info("[%s] follow_up message for %s: %s", session.campaign, public_id, decision.message)
         sent = send_raw_message(session, profile, decision.message)
         if not sent:
-            set_profile_state(session, public_id, ProfileState.QUALIFIED.value)
+            set_profile_state(session, public_id, ProfileState.QUALIFIED)
             logger.warning("follow_up for %s: send failed — moving to QUALIFIED for re-connection", public_id)
             return
-        session.linkedin_profile.record_action(
+        session.account.record_action(
             ActionLog.ActionType.FOLLOW_UP, session.campaign,
         )
         enqueue_follow_up(campaign_id, public_id, delay_seconds=decision.follow_up_hours * 3600)
 
     elif decision.action == "mark_completed":
-        set_profile_state(session, public_id, ProfileState.COMPLETED.value, reason=decision.reason)
+        set_profile_state(session, public_id, ProfileState.COMPLETED, reason=decision.reason)
 
     elif decision.action == "wait":
         enqueue_follow_up(campaign_id, public_id, delay_seconds=decision.follow_up_hours * 3600)

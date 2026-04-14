@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 from linkedin.management.setup_crm import setup_crm
-from tests.factories import UserFactory
 
 
 @pytest.fixture(autouse=True)
@@ -29,17 +28,19 @@ def _mock_embeddings(request):
 
 
 class FakeAccountSession:
-    """Minimal stand-in for AccountSession — exposes django_user + campaign."""
+    """Minimal stand-in for AccountSession — exposes account + campaign."""
 
-    def __init__(self, django_user, linkedin_profile, campaign):
-        self.django_user = django_user
-        self.linkedin_profile = linkedin_profile
+    def __init__(self, account, campaign):
+        self.account = account
         self.campaign = campaign
 
     @property
     def campaigns(self):
         from linkedin.models import Campaign
-        return Campaign.objects.filter(users=self.django_user)
+        return Campaign.objects.filter(account=self.account)
+
+    def invalidate_campaigns_cache(self):
+        pass
 
     def ensure_browser(self):
         pass
@@ -48,21 +49,18 @@ class FakeAccountSession:
 @pytest.fixture
 def fake_session(db):
     """An AccountSession-like object backed by the Django test DB."""
-    from linkedin.models import Campaign, LinkedInProfile
+    from linkedin.models import Campaign, LinkedInAccount
 
-    user = UserFactory(username="testuser")
-
-    campaign = Campaign.objects.first()
-    if campaign is None:
-        campaign = Campaign.objects.create(name="LinkedIn Outreach")
-    campaign.users.add(user)
-
-    linkedin_profile, _ = LinkedInProfile.objects.get_or_create(
-        user=user,
+    account, _ = LinkedInAccount.objects.get_or_create(
+        username="testuser",
         defaults={
             "linkedin_username": "testuser@example.com",
             "linkedin_password": "testpass",
         },
     )
 
-    return FakeAccountSession(django_user=user, linkedin_profile=linkedin_profile, campaign=campaign)
+    campaign = Campaign.objects.filter(account=account).first()
+    if campaign is None:
+        campaign = Campaign.objects.create(name="LinkedIn Outreach", account=account)
+
+    return FakeAccountSession(account=account, campaign=campaign)

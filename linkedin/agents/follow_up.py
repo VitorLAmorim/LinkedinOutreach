@@ -66,7 +66,7 @@ def _render_system_prompt(session, profile: dict, conversation_text: str) -> str
 
     campaign = session.campaign
     self_prof = session.self_profile
-    self_name = f"{self_prof.get('first_name', '')} {self_prof.get('last_name', '')}".strip() or session.django_user.username
+    self_name = f"{self_prof.get('first_name', '')} {self_prof.get('last_name', '')}".strip() or session.account.username
 
     return template.render(
         self_name=self_name,
@@ -99,6 +99,7 @@ def run_follow_up_agent(
     system_prompt = _render_system_prompt(session, profile, conversation_text)
 
     llm_api_key, ai_model, llm_api_base = get_llm_config()
+    # noinspection PyTypeChecker
     llm = ChatOpenAI(
         model=ai_model,
         temperature=0.7,
