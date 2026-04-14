@@ -1,6 +1,7 @@
 # linkedin/browser/login.py
 import logging
 import time
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -27,7 +28,7 @@ SELECTORS = {
 
 def playwright_login(session: "AccountSession"):
     page = session.page
-    lp = session.linkedin_profile
+    account = session.account
     logger.info(colored("Fresh login sequence starting", "cyan") + f" for {session}")
 
     goto_page(
@@ -37,9 +38,9 @@ def playwright_login(session: "AccountSession"):
         error_message="Failed to load login page",
     )
 
-    human_type(page.locator(SELECTORS["email"]), lp.linkedin_username)
+    human_type(page.locator(SELECTORS["email"]), account.linkedin_username)
     session.wait()
-    human_type(page.locator(SELECTORS["password"]), lp.linkedin_password)
+    human_type(page.locator(SELECTORS["password"]), account.linkedin_password)
     session.wait()
 
     goto_page(
@@ -51,37 +52,74 @@ def playwright_login(session: "AccountSession"):
     )
 
 
-def launch_browser(storage_state=None):
+def _build_proxy_config(url: str | None) -> dict | None:
+    # Playwright requires username/password as separate fields — it does not
+    # extract credentials embedded in the server URL. Parse them out so that
+    # authenticated proxies (e.g. webshare rotating residential) work.
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError(f"PROXY_URL={url!r} has no hostname")
+    server = f"{parsed.scheme or 'http'}://{parsed.hostname}"
+    if parsed.port:
+        server += f":{parsed.port}"
+    proxy: dict = {"server": server}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return proxy
+
+
+def _resolve_proxy_url(account=None) -> str:
+    """Per-account proxy_url wins over the global PROXY_URL env var."""
+    from linkedin.conf import PROXY_URL
+
+    if account is not None and getattr(account, "proxy_url", ""):
+        return account.proxy_url
+    return PROXY_URL or ""
+
+
+def launch_browser(storage_state=None, account=None):
     logger.debug("Launching Playwright")
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=False, slow_mo=BROWSER_SLOW_MO)
-    from linkedin.conf import PROXY_URL
-    proxy = {"server": PROXY_URL} if PROXY_URL else None
+    proxy_url = _resolve_proxy_url(account)
+    proxy = _build_proxy_config(proxy_url)
+    if proxy:
+        logger.info("Routing browser through proxy %s", proxy["server"])
     context = browser.new_context(storage_state=storage_state, locale="en-US", proxy=proxy)
     context.set_default_timeout(BROWSER_DEFAULT_TIMEOUT_MS)
     Stealth().apply_stealth_sync(context)
     page = context.new_page()
-    return page, context, browser, playwright
+    return page, context, browser, playwright, proxy_url
 
 
 def _save_cookies(session):
     """Persist Playwright storage state (cookies) to the DB."""
     state = session.context.storage_state()
-    session.linkedin_profile.cookie_data = state
-    session.linkedin_profile.save(update_fields=["cookie_data"])
+    session.account.cookie_data = state
+    session.account.save(update_fields=["cookie_data"])
 
 
 def start_browser_session(session: "AccountSession"):
     logger.debug("Configuring browser for %s", session)
 
-    session.linkedin_profile.refresh_from_db(fields=["cookie_data"])
-    cookie_data = session.linkedin_profile.cookie_data
+    session.account.refresh_from_db(fields=["cookie_data", "proxy_url"])
+    cookie_data = session.account.cookie_data
 
     storage_state = cookie_data if cookie_data else None
     if storage_state:
         logger.info("Loading saved session for %s", session)
 
-    session.page, session.context, session.browser, session.playwright = launch_browser(storage_state=storage_state)
+    (
+        session.page,
+        session.context,
+        session.browser,
+        session.playwright,
+        session._launched_with_proxy,
+    ) = launch_browser(storage_state=storage_state, account=session.account)
 
     if not storage_state:
         playwright_login(session)
@@ -107,11 +145,12 @@ _SETUP_POLL_INTERVAL = 5  # seconds
 
 def interactive_setup(session):
     """Launch browser for manual login via VNC. Polls for auth cookie, saves when found."""
-    page, context, browser, playwright = launch_browser()
+    page, context, browser, playwright, proxy_url = launch_browser(account=session.account)
     session.page = page
     session.context = context
     session.browser = browser
     session.playwright = playwright
+    session._launched_with_proxy = proxy_url
 
     page.goto(LINKEDIN_LOGIN_URL)
     logger.info(

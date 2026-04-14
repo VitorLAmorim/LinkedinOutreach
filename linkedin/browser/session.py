@@ -21,9 +21,8 @@ def random_sleep(min_val, max_val):
 
 
 class AccountSession:
-    def __init__(self, linkedin_profile):
-        self.linkedin_profile = linkedin_profile
-        self.django_user = linkedin_profile.user
+    def __init__(self, account):
+        self.account = account
 
         # Active campaign — set by the daemon before each lane execution
         self.campaign = None
@@ -34,11 +33,40 @@ class AccountSession:
         self.browser = None
         self.playwright = None
 
+        # Proxy string the current browser was launched with. Set by
+        # launch_browser(); compared against the live account.proxy_url by
+        # the daemon to detect runtime proxy changes.
+        self._launched_with_proxy: str | None = None
+
+        # Worker id (container hostname) in pool mode. Populated by the
+        # daemon via bind_worker_id() so the SIGTERM handler can release
+        # the claim cleanly.
+        self._worker_id: str = ""
+
+    def bind_worker_id(self, worker_id: str) -> None:
+        """Tell the session which worker owns it (for claim release on shutdown)."""
+        self._worker_id = worker_id
+
+    def swap_account(self, new_account) -> None:
+        """Swap the bound LinkedInAccount. Browser must already be closed."""
+        if self.page is not None or self.context is not None:
+            raise RuntimeError("swap_account called with a live browser — close it first")
+        logger.info("Swapping session: %s → %s", self.account.username, new_account.username)
+        self.account = new_account
+        self.campaign = None
+        self.invalidate_campaigns_cache()
+        self.__dict__.pop("self_profile", None)
+        self._launched_with_proxy = None
+
     @cached_property
     def campaigns(self):
-        """All campaigns this user belongs to (cached)."""
+        """All campaigns for this account (cached)."""
         from linkedin.models import Campaign
-        return list(Campaign.objects.filter(users=self.django_user, active=True))
+        return list(Campaign.objects.filter(account=self.account, active=True))
+
+    def invalidate_campaigns_cache(self):
+        """Drop the cached campaigns list so the next access re-queries the DB."""
+        self.__dict__.pop("campaigns", None)
 
     def ensure_browser(self):
         """Launch or recover browser + login if needed. Call before using .page"""
@@ -57,8 +85,8 @@ class AccountSession:
         Reads from ``self_lead.profile_data`` if available, otherwise
         discovers via Voyager API and persists.
         """
-        self.linkedin_profile.refresh_from_db(fields=["self_lead"])
-        lead = self.linkedin_profile.self_lead
+        self.account.refresh_from_db(fields=["self_lead"])
+        lead = self.account.self_lead
         if lead and lead.profile_data and "urn" in lead.profile_data:
             return lead.profile_data
 
@@ -77,16 +105,16 @@ class AccountSession:
 
         logger.warning("Re-authenticating %s — clearing saved session", self)
         self.close()
-        self.linkedin_profile.cookie_data = None
-        self.linkedin_profile.save(update_fields=["cookie_data"])
+        self.account.cookie_data = None
+        self.account.save(update_fields=["cookie_data"])
         start_browser_session(session=self)
 
     def _maybe_refresh_cookies(self):
         """Re-login if the li_at auth cookie in the saved DB state is expired."""
         from linkedin.browser.login import start_browser_session
 
-        self.linkedin_profile.refresh_from_db(fields=["cookie_data"])
-        cookie_data = self.linkedin_profile.cookie_data
+        self.account.refresh_from_db(fields=["cookie_data"])
+        cookie_data = self.account.cookie_data
         if not cookie_data:
             return
         for cookie in cookie_data.get("cookies", []):
@@ -111,6 +139,7 @@ class AccountSession:
                 logger.debug("Error closing browser: %s", e)
             finally:
                 self.page = self.context = self.browser = self.playwright = None
+                self._launched_with_proxy = None
 
         logger.info("Account session closed → %s", self)
 
@@ -121,4 +150,30 @@ class AccountSession:
             pass
 
     def __repr__(self) -> str:
-        return self.linkedin_profile.linkedin_username
+        return getattr(self.account, "username", "<unbound>")
+
+
+def install_shutdown_handler(session: "AccountSession") -> None:
+    """Register SIGTERM/SIGINT handlers that release the session's pool claim.
+
+    Without this, `docker stop` leaves the claim row owned by a dead worker
+    until STALE_CLAIM_TIMEOUT expires. With it, the claim frees within ms.
+    """
+    import signal
+
+    def _handler(signum, frame):
+        logger.warning("Received signal %s — releasing claim and closing browser", signum)
+        try:
+            if session._worker_id:
+                from linkedin.accounts.pool import release_account
+                release_account(session.account, session._worker_id)
+        except Exception:
+            logger.exception("Failed to release claim on shutdown")
+        try:
+            session.close()
+        except Exception:
+            logger.exception("Failed to close session on shutdown")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)

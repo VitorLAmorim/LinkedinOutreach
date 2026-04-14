@@ -1,9 +1,10 @@
-# linkedin/admin.py
+import urllib.parse
+
 from django.contrib import admin
 
 from chat.models import ChatMessage
 
-from linkedin.models import ActionLog, Campaign, LinkedInProfile, SearchKeyword, SiteConfig, Task
+from linkedin.models import ActionLog, Campaign, LinkedInAccount, SearchKeyword, SiteConfig, Task
 
 
 @admin.register(SiteConfig)
@@ -19,17 +20,32 @@ class SiteConfigAdmin(admin.ModelAdmin):
 
 @admin.register(Campaign)
 class CampaignAdmin(admin.ModelAdmin):
-    list_display = ("name", "active", "booking_link", "is_freemium", "action_fraction")
-    list_filter = ("active",)
+    list_display = ("name", "account", "active", "booking_link", "is_freemium", "action_fraction")
+    list_filter = ("active", "account")
     list_editable = ("active",)
-    filter_horizontal = ("users",)
+    raw_id_fields = ("account",)
 
 
-@admin.register(LinkedInProfile)
-class LinkedInProfileAdmin(admin.ModelAdmin):
-    list_display = ("user", "linkedin_username", "active", "legal_accepted")
-    list_filter = ("active",)
-    raw_id_fields = ("user", "self_lead")
+@admin.register(LinkedInAccount)
+class LinkedInAccountAdmin(admin.ModelAdmin):
+    list_display = (
+        "username", "linkedin_username", "active", "is_archived",
+        "claimed_by", "last_heartbeat", "proxy_host",
+    )
+    list_filter = ("active", "is_archived", "claimed_by")
+    search_fields = ("username", "linkedin_username", "claimed_by")
+    raw_id_fields = ("self_lead",)
+    readonly_fields = ("claimed_at", "last_heartbeat")
+    exclude = ("linkedin_password",)
+
+    @admin.display(description="Proxy host")
+    def proxy_host(self, obj):
+        if not obj.proxy_url:
+            return ""
+        parsed = urllib.parse.urlparse(obj.proxy_url)
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}" if host else ""
 
 
 @admin.register(SearchKeyword)
@@ -41,11 +57,11 @@ class SearchKeywordAdmin(admin.ModelAdmin):
 
 @admin.register(ActionLog)
 class ActionLogAdmin(admin.ModelAdmin):
-    list_display = ("action_type", "linkedin_profile", "campaign", "created_at")
+    list_display = ("action_type", "account", "campaign", "created_at")
     list_filter = ("action_type", "campaign")
-    raw_id_fields = ("linkedin_profile", "campaign")
+    raw_id_fields = ("account", "campaign")
     date_hierarchy = "created_at"
-    readonly_fields = ("linkedin_profile", "campaign", "action_type", "created_at")
+    readonly_fields = ("account", "campaign", "action_type", "created_at")
 
 
 @admin.register(Task)
