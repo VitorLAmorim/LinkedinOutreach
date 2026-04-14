@@ -25,16 +25,23 @@ from linkedin.diagnostics import failure_diagnostics
 from linkedin.exceptions import AuthenticationError
 from linkedin.ml.qualifier import BayesianQualifier, KitQualifier
 from linkedin.models import Task
+from linkedin.tasks.check_inbox import handle_check_inbox
 from linkedin.tasks.check_pending import handle_check_pending
 from linkedin.tasks.connect import enqueue_check_pending, enqueue_connect, enqueue_follow_up, handle_connect
 from linkedin.tasks.follow_up import handle_follow_up
+from linkedin.tasks.send_message import handle_send_message
 
 logger = logging.getLogger(__name__)
+
+# How often (seconds) the idle daemon polls the DB for a newly activated campaign.
+_IDLE_POLL_INTERVAL = 5
 
 _HANDLERS = {
     Task.TaskType.CONNECT: handle_connect,
     Task.TaskType.CHECK_PENDING: handle_check_pending,
     Task.TaskType.FOLLOW_UP: handle_follow_up,
+    Task.TaskType.SEND_MESSAGE: handle_send_message,
+    Task.TaskType.CHECK_INBOX: handle_check_inbox,
 }
 
 
@@ -64,7 +71,6 @@ def _build_qualifiers(campaigns, cfg, kit_model=None):
     from crm.models import Lead
 
     qualifiers: dict[int, BayesianQualifier | KitQualifier] = {}
-    n_regular = 0
     for campaign in campaigns:
         if campaign.is_freemium:
             if kit_model is None:
@@ -86,7 +92,6 @@ def _build_qualifiers(campaigns, cfg, kit_model=None):
                     len(y), int((y == 1).sum()), int((y == 0).sum()), campaign,
                 )
             qualifiers[campaign.pk] = q
-            n_regular += 1
 
     return qualifiers
 
@@ -106,7 +111,6 @@ def seconds_until_active() -> float:
     if now.weekday() not in REST_DAYS and ACTIVE_START_HOUR <= now.hour < ACTIVE_END_HOUR:
         return 0.0
 
-    # Find the next active start: try today first, then subsequent days
     candidate = timezone.make_aware(
         now.replace(hour=ACTIVE_START_HOUR, minute=0, second=0, microsecond=0, tzinfo=None),
         timezone=tz,
@@ -144,26 +148,48 @@ def remaining_active_seconds() -> float:
 
 
 # ------------------------------------------------------------------
+# Active-campaign tracking (one campaign per account at any time)
+# ------------------------------------------------------------------
+
+
+def get_active_campaign_id(account) -> int | None:
+    """Return the PK of the currently active campaign for the account, or None."""
+    from linkedin.models import Campaign
+    return Campaign.objects.filter(account=account, active=True).values_list("pk", flat=True).first()
+
+
+def cancel_pending_tasks_for_campaign(campaign_id: int) -> int:
+    """Cancel all pending tasks for a deactivated campaign."""
+    return Task.objects.filter(
+        status=Task.Status.PENDING,
+        payload__campaign_id=campaign_id,
+    ).update(status=Task.Status.CANCELLED, completed_at=timezone.now())
+
+
+# ------------------------------------------------------------------
 # Task queue worker
 # ------------------------------------------------------------------
 
 
 def heal_tasks(session):
-    """Reconcile task queue with CRM state on daemon startup.
+    """Reconcile task queue with CRM state on daemon startup or campaign swap.
 
     1. Reset stale 'running' tasks to 'pending' (crashed worker recovery)
     2. Seed one 'connect' task per campaign if none pending
     3. Create 'check_pending' tasks for PENDING profiles without tasks
     4. Create 'follow_up' tasks for CONNECTED profiles without tasks
+    5. Seed check_inbox tasks per campaign if webhook is configured
     """
     from crm.models import Deal
     from linkedin.url_utils import url_to_public_id
     from linkedin.enums import ProfileState
 
     cfg = CAMPAIGN_CONFIG
-
-    # 1. Recover stale running tasks (only for own campaigns)
     campaign_ids = [c.pk for c in session.campaigns]
+    if not campaign_ids:
+        logger.info("heal_tasks: no active campaigns for %s", session.account.username)
+        return
+
     stale_count = Task.objects.filter(
         status=Task.Status.RUNNING,
         payload__campaign_id__in=campaign_ids,
@@ -173,12 +199,10 @@ def heal_tasks(session):
     if stale_count:
         logger.info("Recovered %d stale running tasks", stale_count)
 
-    # 2. Seed connect tasks per campaign (regular first, freemium deferred)
     for campaign in session.campaigns:
         delay = CAMPAIGN_CONFIG["connect_delay_seconds"] if campaign.is_freemium else 0
         enqueue_connect(campaign.pk, delay_seconds=delay)
 
-    # 3. Check_pending tasks for PENDING profiles
     for campaign in session.campaigns:
         session.campaign = campaign
         pending_deals = Deal.objects.filter(
@@ -193,7 +217,6 @@ def heal_tasks(session):
             backoff = deal.backoff_hours or cfg["check_pending_recheck_after_hours"]
             enqueue_check_pending(campaign.pk, public_id, backoff_hours=backoff)
 
-    # 4. Follow_up tasks for CONNECTED profiles
     for campaign in session.campaigns:
         session.campaign = campaign
         connected_deals = Deal.objects.filter(
@@ -207,54 +230,184 @@ def heal_tasks(session):
                 continue
             enqueue_follow_up(campaign.pk, public_id, delay_seconds=random.uniform(5, 60))
 
+    from linkedin.conf import WEBHOOK_URL
+    if WEBHOOK_URL:
+        from linkedin.tasks.check_inbox import enqueue_check_inbox
+        for campaign in session.campaigns:
+            enqueue_check_inbox(campaign.pk)
+
     own_tasks = Task.objects.filter(payload__campaign_id__in=campaign_ids)
     pending_count = own_tasks.pending().count()
     logger.info("Task queue healed: %d pending tasks", pending_count)
 
 
-def run_daemon(session):
+class _PlaceholderAccount:
+    """Stand-in for when pool mode has no eligible account yet."""
+    pk = None
+    username = "<pool-idle>"
+    linkedin_username = "<pool-idle>"
+    is_archived = True
+    active = False
+    proxy_url = ""
+    cookie_data = None
+
+
+def _refresh_account_binding(session, worker_id: str) -> bool:
+    """Pool-mode hot-swap check. Returns True if the session swapped accounts.
+
+    Heartbeat the current claim. If our account stopped being eligible
+    (archived, deactivated, or lost its active campaign), release the claim,
+    tear down the browser, claim a new account, and relaunch. If no eligible
+    account is available, the session is left with no browser and the caller
+    should short-circuit to an idle sleep.
+    """
+    if not worker_id:
+        return False
+
+    from linkedin.accounts.pool import (
+        claim_next_account, heartbeat, is_still_eligible, release_account,
+    )
+
+    owned = heartbeat(session.account, worker_id)
+    if owned and is_still_eligible(session.account):
+        return False
+
+    if not owned:
+        logger.warning(
+            colored("Claim lost", "yellow", attrs=["bold"])
+            + " for account=%s — someone else stole it. Releasing and rebinding.",
+            session.account.username,
+        )
+    else:
+        logger.info(
+            colored("Releasing account", "yellow", attrs=["bold"])
+            + "=%s — no longer eligible (campaign deactivated or account archived)",
+            session.account.username,
+        )
+        release_account(session.account, worker_id)
+
+    session.close()
+
+    new_account = claim_next_account(worker_id)
+    if new_account is None:
+        logger.info("No eligible account to claim — idling")
+        session.account = _PlaceholderAccount()  # daemon will treat as no-op
+        return True
+
+    session.swap_account(new_account)
+    session.ensure_browser()
+    return True
+
+
+def _refresh_proxy(session) -> bool:
+    """Detect a runtime proxy change on the current account and restart the browser.
+
+    Returns True if the browser was restarted. No-op if proxy is unchanged,
+    browser is not currently launched, or the session is holding the idle
+    placeholder account (which has no DB row).
+    """
+    if session.page is None:
+        return False
+    if isinstance(session.account, _PlaceholderAccount):
+        return False
+
+    from linkedin.browser.login import _resolve_proxy_url
+
+    session.account.refresh_from_db(fields=["proxy_url"])
+    current = _resolve_proxy_url(session.account)
+    if current == (session._launched_with_proxy or ""):
+        return False
+
+    logger.info(
+        colored("Proxy changed", "yellow", attrs=["bold"])
+        + " for %s — restarting browser", session.account.username,
+    )
+    session.close()
+    session.ensure_browser()
+    return True
+
+
+def _refresh_active_campaign(session, last_active_id, qualifiers, kit_model):
+    """Detect a campaign-activation change for this account and react.
+
+    Returns the (possibly new) active campaign id and a flag indicating
+    whether qualifiers were rebuilt.
+    """
+    current_id = get_active_campaign_id(session.account)
+    if current_id == last_active_id:
+        return last_active_id, qualifiers
+
+    if last_active_id is not None:
+        cancelled = cancel_pending_tasks_for_campaign(last_active_id)
+        logger.info(
+            colored("Campaign deactivated", "yellow", attrs=["bold"])
+            + " — cancelled %d pending tasks for campaign id=%s",
+            cancelled, last_active_id,
+        )
+
+    session.invalidate_campaigns_cache()
+
+    if current_id is None:
+        session.campaign = None
+        logger.info("No active campaign for %s — idling", session.account.username)
+        return None, {}
+
+    if not session.campaigns:
+        # get_active_campaign_id saw an active row but the M2M query came
+        # back empty — race window between activate/deactivate on different
+        # threads. Treat as idle and re-check on the next loop iteration.
+        session.campaign = None
+        logger.info(
+            "No campaigns resolved for %s despite current_id=%s — will retry",
+            session.account.username, current_id,
+        )
+        return None, {}
+
+    qualifiers = _build_qualifiers(session.campaigns, CAMPAIGN_CONFIG, kit_model=kit_model)
+    session.campaign = session.campaigns[0]
+    heal_tasks(session)
+    logger.info(
+        colored("Campaign activated", "green", attrs=["bold"])
+        + " — %s (id=%s) for %s",
+        session.campaign, current_id, session.account.username,
+    )
+    return current_id, qualifiers
+
+
+def run_daemon(session, worker_id: str = ""):
     from linkedin.ml.hub import fetch_kit
-    from linkedin.setup.freemium import import_freemium_campaign
+    from linkedin.setup.freemium import import_freemium_campaign, seed_profiles
     from linkedin.models import Campaign
 
     cfg = CAMPAIGN_CONFIG
 
-    # Load kit model for freemium campaigns
+    session.bind_worker_id(worker_id)
+
     kit = fetch_kit()
-    if kit:
-        freemium_campaign = import_freemium_campaign(kit["config"])
+    kit_model = kit["model"] if kit else None
+    if kit and not isinstance(session.account, _PlaceholderAccount):
+        freemium_campaign = import_freemium_campaign(session.account, kit["config"])
         if freemium_campaign:
             prev_campaign = session.campaign
             session.campaign = freemium_campaign
-            from linkedin.setup.freemium import seed_profiles
             seed_profiles(session, kit["config"])
             session.campaign = prev_campaign
 
-    qualifiers = _build_qualifiers(
-        session.campaigns, cfg, kit_model=kit["model"] if kit else None,
-    )
+    session.invalidate_campaigns_cache()
+    qualifiers = _build_qualifiers(session.campaigns, cfg, kit_model=kit_model)
 
-    # Startup healing
-    heal_tasks(session)
-
-    campaigns = session.campaigns
-    if not campaigns:
-        logger.error("No campaigns found — cannot start daemon")
-        return
-
-    campaign_ids = [c.pk for c in campaigns]
-    own_tasks = Task.objects.filter(payload__campaign_id__in=campaign_ids)
+    last_active_id = get_active_campaign_id(session.account)
+    if last_active_id is not None:
+        heal_tasks(session)
 
     logger.info(
         colored("Daemon started", "green", attrs=["bold"])
-        + " — %d campaigns, task queue worker",
-        len(campaigns),
+        + " — account=%s, %d active campaigns, worker_id=%s",
+        session.account.username, len(session.campaigns), worker_id or "<pinned>",
     )
 
     freemium = _FreemiumRotator(every=2)
 
-    # Single-threaded: one task at a time, no concurrent enqueuing,
-    # so sleeping until the next scheduled_at is safe.
     while True:
         pause = seconds_until_active()
         if pause > 0:
@@ -263,21 +416,42 @@ def run_daemon(session):
             time.sleep(pause)
             continue
 
+        # Pool-mode hot-swap: check whether our claimed account is still eligible.
+        if _refresh_account_binding(session, worker_id):
+            last_active_id = None  # force _refresh_active_campaign to reseed
+            qualifiers = _build_qualifiers(session.campaigns, cfg, kit_model=kit_model)
+            if isinstance(session.account, _PlaceholderAccount):
+                time.sleep(_IDLE_POLL_INTERVAL)
+                continue
+
+        # Per-account proxy hot-swap: restart browser if proxy_url changed.
+        _refresh_proxy(session)
+
+        last_active_id, qualifiers = _refresh_active_campaign(
+            session, last_active_id, qualifiers, kit_model,
+        )
+
+        if last_active_id is None:
+            time.sleep(_IDLE_POLL_INTERVAL)
+            continue
+
+        campaign_ids = [c.pk for c in session.campaigns]
+        own_tasks = Task.objects.filter(payload__campaign_id__in=campaign_ids)
+
         task = own_tasks.claim_next()
         if task is None:
             wait = own_tasks.seconds_to_next()
             if wait is None:
-                logger.info("Queue empty — nothing to do")
-                return
-            if wait > 0:
-                h, m = int(wait // 3600), int(wait % 3600 // 60)
-                logger.info("Next task in %dh%02dm — sleeping", h, m)
-                time.sleep(wait)
+                time.sleep(_IDLE_POLL_INTERVAL)
+                continue
+            sleep_for = min(wait, _IDLE_POLL_INTERVAL) if wait > 0 else 0
+            if sleep_for > 0:
+                time.sleep(sleep_for)
             continue
 
         campaign = Campaign.objects.filter(pk=task.payload.get("campaign_id")).first()
-        if not campaign:
-            task.mark_failed(f"Campaign {task.payload.get('campaign_id')} not found")
+        if not campaign or not campaign.active:
+            task.mark_cancelled()
             continue
 
         session.campaign = campaign
