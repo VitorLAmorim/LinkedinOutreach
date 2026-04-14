@@ -1,10 +1,11 @@
 # linkedin/actions/message.py
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, NamedTuple
 
 from playwright.sync_api import Error as PlaywrightError, Locator
 from linkedin.browser.nav import goto_page, human_type, dump_page_html
+from linkedin.exceptions import AuthenticationError, MessageSendAmbiguous
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +154,37 @@ def _click_send_and_verify(session, page) -> bool:
 # ── Public entry point ────────────────────────────────────────────
 
 
+class APIResult(NamedTuple):
+    status: str  # "sent" | "clean_failure"
+    detail: str
+
+
 def send_raw_message(session, profile: Dict[str, Any], message: str) -> bool:
-    """Send an arbitrary message to a profile. Returns True if sent."""
+    """Send a message to a profile. Voyager API first, browser fallbacks after.
+
+    The Voyager createMessage API returns in single-digit seconds, while the
+    browser strategies take 30-60s due to navigation and human-like waits.
+
+    Browser fallback runs ONLY on a clean API failure (known precondition
+    violation — missing URN, no conversation). If the API call itself was
+    ambiguous (timeout, 5xx after retries, parse error), ``_send_message_via_api``
+    raises ``MessageSendAmbiguous`` and this function re-raises without falling
+    back — doing so would risk double-delivery.
+    """
+    public_identifier = profile.get("public_identifier")
+
+    result = _send_message_via_api(session, profile, message)
+    if result.status == "sent":
+        return True
+
+    logger.warning(
+        "API send clean_failure (%s) for %s — falling back to browser",
+        result.detail, public_identifier,
+    )
+
     from linkedin.actions.search import _go_to_profile
     from linkedin.url_utils import public_id_to_url
 
-    public_identifier = profile.get("public_identifier")
     _go_to_profile(session, public_id_to_url(public_identifier), public_identifier)
 
     if _send_msg_pop_up(session, profile, message):
@@ -168,9 +194,6 @@ def send_raw_message(session, profile: Dict[str, Any], message: str) -> bool:
     if _send_message(session, profile, message):
         return True
     dump_page_html(session, profile, category="message_direct")
-
-    if _send_message_via_api(session, profile, message):
-        return True
 
     logger.error("All send methods failed for %s", public_identifier)
     return False
@@ -257,20 +280,25 @@ def _send_message(session, profile: Dict[str, Any], message: str) -> bool:
         return False
 
 
-def _send_message_via_api(session, profile: Dict[str, Any], message: str) -> bool:
-    """Last-resort fallback: send via Voyager Messaging API.
+def _send_message_via_api(session, profile: Dict[str, Any], message: str) -> APIResult:
+    """Primary send path: via Voyager Messaging API.
 
-    Requires profile dict to contain 'urn' (target profile URN).
+    Returns ``APIResult("sent", ...)`` on success or ``APIResult("clean_failure",
+    reason)`` when we know the message was not dispatched (missing URN, no
+    conversation). Raises ``MessageSendAmbiguous`` when the POST was sent but
+    the outcome is unclear (timeout, 5xx exhausted, parse error) — caller must
+    NOT retry. Propagates ``AuthenticationError`` so the daemon can re-auth.
     """
     from linkedin.api.client import PlaywrightLinkedinAPI
     from linkedin.api.messaging import send_message
-    from linkedin.actions.conversations import find_conversation_urn, find_conversation_urn_via_navigation
+    from linkedin.actions.conversations import (
+        find_conversation_urn, find_conversation_urn_via_navigation,
+    )
 
     public_identifier = profile.get("public_identifier")
     target_urn = profile.get("urn")
     if not target_urn:
-        logger.error("API send failed for %s → no URN in profile dict", public_identifier)
-        return False
+        return APIResult("clean_failure", "no URN in profile dict")
 
     mailbox_urn = session.self_profile["urn"]
     api = PlaywrightLinkedinAPI(session=session)
@@ -279,16 +307,28 @@ def _send_message_via_api(session, profile: Dict[str, Any], message: str) -> boo
     if not conversation_urn:
         conversation_urn = find_conversation_urn_via_navigation(session, target_urn)
     if not conversation_urn:
-        logger.error("API send failed for %s → no conversation found", public_identifier)
-        return False
+        return APIResult("clean_failure", "no conversation found")
 
     try:
         send_message(api, conversation_urn, message, mailbox_urn)
-        logger.info("Message sent to %s (API fallback)", public_identifier)
-        return True
-    except Exception as e:
-        logger.error("API send failed for %s → %s", public_identifier, e)
-        return False
+    except AuthenticationError:
+        raise
+    except (IOError, json.JSONDecodeError) as e:
+        # IOError: Voyager 4xx/5xx after tenacity retries exhausted. Even a
+        # clean 4xx "access denied" cannot be distinguished from "we posted
+        # then the response body tripped check_response" without deeper
+        # inspection — treat the entire post-dispatch failure space as
+        # ambiguous to prevent double-sends.
+        logger.warning(
+            "Voyager send ambiguous for %s → %s: %s",
+            public_identifier, type(e).__name__, e,
+        )
+        raise MessageSendAmbiguous(
+            f"Voyager send to {public_identifier!r} raised {type(e).__name__}: {e}"
+        ) from e
+
+    logger.info("Message sent to %s (API)", public_identifier)
+    return APIResult("sent", "")
 
 
 if __name__ == "__main__":

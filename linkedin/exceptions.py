@@ -17,3 +17,18 @@ class ReachedConnectionLimit(Exception):
     """ Weekly connection limit reached. """
     pass
 
+
+class MessageSendAmbiguous(Exception):
+    """Voyager POST failed in a way that may have delivered the message.
+
+    Raised when the API call timed out, returned a 5xx after retries, or the
+    response body could not be parsed. Callers MUST NOT retry or fall back —
+    doing so risks double-delivery. Surface to the operator instead.
+    """
+    pass
+
+
+class LeadNotFoundError(Exception):
+    """send_message task received a public_id with no matching Lead."""
+    pass
+

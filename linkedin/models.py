@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from django.contrib.auth.models import User
 from django.db import models
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -42,31 +42,8 @@ class SiteConfig(models.Model):
         return obj
 
 
-class Campaign(models.Model):
-    name = models.CharField(max_length=200, unique=True)
-    users = models.ManyToManyField(User, blank=True, related_name="campaigns")
-    product_docs = models.TextField(blank=True)
-    campaign_objective = models.TextField(blank=True)
-    booking_link = models.URLField(max_length=500, blank=True)
-    is_freemium = models.BooleanField(default=False)
-    action_fraction = models.FloatField(default=0.2)
-    seed_public_ids = models.JSONField(default=list, blank=True)
-    model_blob = models.BinaryField(null=True, blank=True)
-    active = models.BooleanField(default=True)
-
-    def __str__(self):
-        return self.name
-
-    class Meta:
-        app_label = "linkedin"
-
-
-class LinkedInProfile(models.Model):
-    user = models.OneToOneField(
-        User,
-        on_delete=models.CASCADE,
-        related_name="linkedin_profile",
-    )
+class LinkedInAccount(models.Model):
+    username = models.CharField(max_length=150, unique=True)
     self_lead = models.ForeignKey(
         "crm.Lead",
         null=True,
@@ -78,6 +55,7 @@ class LinkedInProfile(models.Model):
     linkedin_password = models.CharField(max_length=200)
     subscribe_newsletter = models.BooleanField(default=True)
     active = models.BooleanField(default=True)
+    is_archived = models.BooleanField(default=False)
     connect_daily_limit = models.PositiveIntegerField(default=20)
     connect_weekly_limit = models.PositiveIntegerField(default=100)
     follow_up_daily_limit = models.PositiveIntegerField(default=30)
@@ -85,13 +63,20 @@ class LinkedInProfile(models.Model):
     cookie_data = models.JSONField(null=True, blank=True)
     newsletter_processed = models.BooleanField(default=False)
 
+    # Per-account proxy — empty string falls back to env PROXY_URL in launch_browser.
+    proxy_url = models.CharField(max_length=500, blank=True, default="")
+
+    # Worker pool coordination. claimed_by=="" means unclaimed.
+    claimed_by = models.CharField(max_length=100, blank=True, default="", db_index=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    last_heartbeat = models.DateTimeField(null=True, blank=True)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._exhausted: dict[str, date] = {}
 
     def can_execute(self, action_type: str) -> bool:
         """Check if the action is allowed under daily/weekly rate limits."""
-        # Reset exhaustion flag on a new day
         exhausted_date = self._exhausted.get(action_type)
         if exhausted_date is not None and exhausted_date != date.today():
             del self._exhausted[action_type]
@@ -113,21 +98,19 @@ class LinkedInProfile(models.Model):
 
         return True
 
-    def record_action(self, action_type: str, campaign: Campaign) -> None:
-        """Persist a rate-limited action."""
+    def record_action(self, action_type: str, campaign: "Campaign") -> None:
         ActionLog.objects.create(
-            linkedin_profile=self, campaign=campaign, action_type=action_type,
+            account=self, campaign=campaign, action_type=action_type,
         )
 
     def mark_exhausted(self, action_type: str) -> None:
-        """Mark the action type as externally exhausted for today."""
         self._exhausted[action_type] = date.today()
         logger.warning("Rate limit: %s externally exhausted for today", action_type)
 
     def _daily_count(self, action_type: str) -> int:
         today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
         return ActionLog.objects.filter(
-            linkedin_profile=self, action_type=action_type,
+            account=self, action_type=action_type,
             created_at__gte=today_start,
         ).count()
 
@@ -137,15 +120,47 @@ class LinkedInProfile(models.Model):
             hour=0, minute=0, second=0, microsecond=0,
         )
         return ActionLog.objects.filter(
-            linkedin_profile=self, action_type=action_type,
+            account=self, action_type=action_type,
             created_at__gte=monday,
         ).count()
 
     def __str__(self):
-        return f"{self.user.username} ({self.linkedin_username})"
+        return f"{self.username} ({self.linkedin_username})"
 
     class Meta:
         app_label = "linkedin"
+
+
+class Campaign(models.Model):
+    name = models.CharField(max_length=200, unique=True)
+    account = models.ForeignKey(
+        LinkedInAccount,
+        on_delete=models.CASCADE,
+        related_name="campaigns",
+    )
+    product_docs = models.TextField(blank=True)
+    campaign_objective = models.TextField(blank=True)
+    booking_link = models.URLField(max_length=500, blank=True)
+    is_freemium = models.BooleanField(default=False)
+    action_fraction = models.FloatField(default=0.2)
+    seed_public_ids = models.JSONField(default=list, blank=True)
+    model_blob = models.BinaryField(null=True, blank=True)
+    active = models.BooleanField(default=False)
+    last_inbox_check_at = models.DateTimeField(null=True, blank=True)
+    inbox_bootstrap_complete = models.BooleanField(default=False)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        app_label = "linkedin"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["account"],
+                condition=Q(active=True),
+                name="one_active_campaign_per_account",
+            ),
+        ]
 
 
 class SearchKeyword(models.Model):
@@ -171,8 +186,8 @@ class ActionLog(models.Model):
         CONNECT = "connect", "Connect"
         FOLLOW_UP = "follow_up", "Follow Up"
 
-    linkedin_profile = models.ForeignKey(
-        LinkedInProfile,
+    account = models.ForeignKey(
+        LinkedInAccount,
         on_delete=models.CASCADE,
         related_name="action_logs",
     )
@@ -187,16 +202,27 @@ class ActionLog(models.Model):
     class Meta:
         app_label = "linkedin"
         indexes = [
-            models.Index(fields=["linkedin_profile", "action_type", "created_at"]),
+            models.Index(fields=["account", "action_type", "created_at"]),
         ]
 
     def __str__(self):
-        return f"{self.action_type} by {self.linkedin_profile} at {self.created_at}"
+        return f"{self.action_type} by {self.account} at {self.created_at}"
 
 
 class TaskQuerySet(models.QuerySet):
     def pending(self):
-        return self.filter(status=Task.Status.PENDING).order_by("scheduled_at")
+        # send_message tasks jump the queue so manual API sends execute next.
+        return (
+            self.filter(status=Task.Status.PENDING)
+            .annotate(
+                _priority=Case(
+                    When(task_type=Task.TaskType.SEND_MESSAGE, then=Value(0)),
+                    default=Value(1),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("_priority", "scheduled_at")
+        )
 
     def due(self):
         return self.pending().filter(scheduled_at__lte=timezone.now())
@@ -217,14 +243,17 @@ class Task(models.Model):
         CONNECT = "connect"
         CHECK_PENDING = "check_pending"
         FOLLOW_UP = "follow_up"
+        SEND_MESSAGE = "send_message"
+        CHECK_INBOX = "check_inbox"
 
     class Status(models.TextChoices):
         PENDING = "pending"
         RUNNING = "running"
         COMPLETED = "completed"
         FAILED = "failed"
+        CANCELLED = "cancelled"
 
-    task_type = models.CharField(max_length=20, choices=TaskType.choices)
+    task_type = models.CharField(max_length=30, choices=TaskType.choices)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     scheduled_at = models.DateTimeField()
     payload = models.JSONField(default=dict)
@@ -258,6 +287,11 @@ class Task(models.Model):
         self.status = self.Status.FAILED
         self.error = error
         self.save(update_fields=["status", "error"])
+
+    def mark_cancelled(self):
+        self.status = self.Status.CANCELLED
+        self.completed_at = timezone.now()
+        self.save(update_fields=["status", "completed_at"])
 
     def reset_to_pending(self):
         self.status = self.Status.PENDING
