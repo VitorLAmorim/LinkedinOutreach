@@ -25,6 +25,10 @@ make setup    # install deps + browsers + migrate + bootstrap CRM
 make run      # run daemon
 make admin    # Django Admin at localhost:8000/admin/
 make setup-account <username>  # Docker VNC login for an account (uses stored proxy_url). VNC on 5910, noVNC on 6090.
+<<<<<<< Updated upstream
+=======
+make browse-account <username> # Docker browser + proxy with saved cookies, no automation. VNC on 5911, noVNC on 6091.
+>>>>>>> Stashed changes
 
 # Testing
 make test / make docker-test

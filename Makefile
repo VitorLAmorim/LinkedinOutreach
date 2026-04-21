@@ -1,5 +1,9 @@
 .DEFAULT_GOAL := help
+<<<<<<< Updated upstream
 .PHONY: help logs test docker-test stop build up up-view install setup setup-account run admin view view-1 view-2 view-3 view-4
+=======
+.PHONY: help logs test docker-test stop build up up-view install setup setup-account browse-account run admin view view-1 view-2 view-3 view-4
+>>>>>>> Stashed changes
 
 # Positional argument for `make setup-account <username>`.
 # Only active when `setup-account` is the first goal, so it doesn't shadow
@@ -8,6 +12,15 @@ ifeq (setup-account,$(firstword $(MAKECMDGOALS)))
 SETUP_ACCOUNT_ARG := $(wordlist 2,2,$(MAKECMDGOALS))
 $(eval $(SETUP_ACCOUNT_ARG):;@:)
 endif
+<<<<<<< Updated upstream
+=======
+
+# Positional argument for `make browse-account <username>`.
+ifeq (browse-account,$(firstword $(MAKECMDGOALS)))
+BROWSE_ACCOUNT_ARG := $(wordlist 2,2,$(MAKECMDGOALS))
+$(eval $(BROWSE_ACCOUNT_ARG):;@:)
+endif
+>>>>>>> Stashed changes
 
 help:
 	@perl -nle'print $& if m{^[a-zA-Z_-]+:.*?## .*$$}' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -46,6 +59,25 @@ setup-account: ## interactive VNC login for a LinkedIn account (usage: make setu
 		-p 6090:6080 \
 		worker-pool
 
+<<<<<<< Updated upstream
+=======
+browse-account: ## open a browser with saved cookies + the account's proxy_url, no automation (usage: make browse-account <username>).
+	@test -n "$(BROWSE_ACCOUNT_ARG)" || { echo "usage: make browse-account <username>"; exit 1; }
+	docker compose -f local.yml up -d postgres
+	@echo ""
+	@echo ">>> Browse mode for account '$(BROWSE_ACCOUNT_ARG)' (no daemon, no automation)"
+	@echo ">>> Connect via VNC:   vnc://localhost:5911"
+	@echo ">>> Or noVNC in browser: http://localhost:6091/vnc.html"
+	@echo ">>> Ctrl+C (or docker stop) to exit."
+	@echo ""
+	docker compose -f local.yml run --rm \
+		-e RUN_MODE=browse \
+		-e LINKEDIN_PROFILE=$(BROWSE_ACCOUNT_ARG) \
+		-p 5911:5900 \
+		-p 6091:6080 \
+		worker-pool
+
+>>>>>>> Stashed changes
 # Docker targets
 logs: ## follow the logs of the service
 	docker compose -f local.yml logs -f
