@@ -1,5 +1,13 @@
 .DEFAULT_GOAL := help
-.PHONY: help logs test docker-test stop build up up-view install setup run admin view view-1 view-2 view-3 view-4
+.PHONY: help logs test docker-test stop build up up-view install setup setup-account run admin view view-1 view-2 view-3 view-4
+
+# Positional argument for `make setup-account <username>`.
+# Only active when `setup-account` is the first goal, so it doesn't shadow
+# real targets like `make test`.
+ifeq (setup-account,$(firstword $(MAKECMDGOALS)))
+SETUP_ACCOUNT_ARG := $(wordlist 2,2,$(MAKECMDGOALS))
+$(eval $(SETUP_ACCOUNT_ARG):;@:)
+endif
 
 help:
 	@perl -nle'print $& if m{^[a-zA-Z_-]+:.*?## .*$$}' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -22,6 +30,21 @@ test: ## run the test suite
 admin: ## start the Django Admin web server (with postgres)
 	docker compose -f local.yml up -d postgres
 	docker compose -f local.yml up admin
+
+setup-account: ## interactive VNC login for a LinkedIn account (usage: make setup-account <username>). Uses the account's stored proxy_url.
+	@test -n "$(SETUP_ACCOUNT_ARG)" || { echo "usage: make setup-account <username>"; exit 1; }
+	docker compose -f local.yml up -d postgres
+	@echo ""
+	@echo ">>> Starting setup for account '$(SETUP_ACCOUNT_ARG)'"
+	@echo ">>> Connect via VNC:   vnc://localhost:5910"
+	@echo ">>> Or noVNC in browser: http://localhost:6090/vnc.html"
+	@echo ""
+	docker compose -f local.yml run --rm \
+		-e RUN_MODE=setup \
+		-e LINKEDIN_PROFILE=$(SETUP_ACCOUNT_ARG) \
+		-p 5910:5900 \
+		-p 6090:6080 \
+		worker-pool
 
 # Docker targets
 logs: ## follow the logs of the service

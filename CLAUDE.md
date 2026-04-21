@@ -24,6 +24,7 @@ make build / make up / make stop / make logs / make up-view
 make setup    # install deps + browsers + migrate + bootstrap CRM
 make run      # run daemon
 make admin    # Django Admin at localhost:8000/admin/
+make setup-account <username>  # Docker VNC login for an account (uses stored proxy_url). VNC on 5910, noVNC on 6090.
 
 # Testing
 make test / make docker-test

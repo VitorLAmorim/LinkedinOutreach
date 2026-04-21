@@ -136,20 +136,24 @@ Every worker needs at least one eligible account. Two paths:
 
 ### Option A — interactive VNC onboarding (recommended for real accounts)
 
+The account row must already exist in the DB (create it via the REST API
+below or in `/admin/`) before running setup. Then:
+
 ```bash
-# Spin up a pinned worker in setup mode. Temporarily uncomment the
-# worker-1 service block in local.yml, then:
-docker compose -f local.yml run --rm \
-  -e RUN_MODE=setup \
-  -e LINKEDIN_PROFILE=<new-username> \
-  --service-ports worker-1
+make setup-account <username>
 ```
 
-Attach to `vnc://localhost:5901` with any VNC client
-(`make view-1` starts Vinagre) and complete the LinkedIn email/password +
-2FA flow inside the Chromium window. The container polls for the auth
-cookie, writes it to `LinkedInAccount.cookie_data`, and exits. After that,
-delete/comment out the pinned worker block — pool mode takes over.
+This brings up `postgres`, runs the `worker-pool` image once with
+`RUN_MODE=setup` and `LINKEDIN_PROFILE=<username>`, and publishes VNC on
+fixed ports `5910` (raw VNC) and `6090` (noVNC). Attach with any VNC
+client or open `http://localhost:6090/vnc.html` and complete the LinkedIn
+email/password + 2FA flow inside the Chromium window. The container polls
+for the auth cookie, writes it to `LinkedInAccount.cookie_data`, and exits.
+
+The browser launches with the account's stored `proxy_url`
+(`_resolve_proxy_url(account)` falls back to env `PROXY_URL` if unset), so
+the login and all subsequent Voyager traffic go through the same proxy the
+daemon will use.
 
 ### Option B — REST API (for automation / testing)
 
