@@ -33,12 +33,13 @@ Docker `start` script dispatches on `RUN_MODE` env var: `admin` (Django Admin we
 - `OnboardConfig.from_json(path)` — from JSON file (cloud / non-interactive).
 - `collect_from_wizard()` — interactive questionary wizard (needs TTY), only asks for `missing_keys()`.
 
-Single write path: `apply(config)` — idempotent, creates missing LinkedInAccount, Campaign, env vars, and legal acceptance. Four components:
+Single write path: `apply(config)` — idempotent, creates missing LinkedInAccount, Campaign, and legal acceptance. Three components:
 
 1. **LinkedInAccount** — email, password, newsletter, rate limits. `username` is derived from the email slug. No Django User created.
 2. **Campaign** — name, product docs, objective, booking link, seed URLs. New campaigns are created with `active=False` and an `account` FK; the operator activates one via `POST /api/campaigns/<id>/activate/`.
-3. **LLM config** — `LLM_API_KEY`, `AI_MODEL`, `LLM_API_BASE` → writes to `SiteConfig` singleton in DB.
-4. **Legal notice** — per-account acceptance stored as `LinkedInAccount.legal_accepted`.
+3. **Legal notice** — per-account acceptance stored as `LinkedInAccount.legal_accepted`.
+
+LLM config (`LLM_API_KEY`, `AI_MODEL`, `LLM_API_BASE`) is NOT part of onboarding — it lives in `.env` and is read at process start via `linkedin.conf.get_llm_config()`. Rotating a key requires updating `.env` and restarting the admin + worker containers.
 
 ## Profile State Machine
 
@@ -80,7 +81,7 @@ Three apps in `INSTALLED_APPS`:
 
 ## CRM Data Model
 
-- **SiteConfig** (`linkedin/models.py`) — Singleton (pk=1). `llm_api_key`, `ai_model`, `llm_api_base`. Accessed via `SiteConfig.load()` / `conf.get_llm_config()`.
+- **SiteConfig** (`linkedin/models.py`) — Legacy singleton table. LLM config has moved to `.env` env vars (`LLM_API_KEY`, `AI_MODEL`, `LLM_API_BASE`); the model still exists to keep migration 0003 valid but is no longer read by runtime code. Not registered in Django Admin.
 - **LinkedInAccount** (`linkedin/models.py`) — Standalone account model (renamed from `LinkedInProfile`, no Django User FK). Fields: `username` (unique, replaces the old Django username), `linkedin_username`, `linkedin_password`, `cookie_data`, `self_lead` FK to Lead, `subscribe_newsletter`, `active`, `is_archived` (soft-delete), rate limits (`connect_daily_limit`, `connect_weekly_limit`, `follow_up_daily_limit`), `legal_accepted`, `newsletter_processed`, `proxy_url` (per-account proxy, overrides env `PROXY_URL`), `claimed_by` (worker id — empty string = unclaimed, db_index), `claimed_at`, `last_heartbeat`. Methods: `can_execute`/`record_action`/`mark_exhausted`. In-memory `_exhausted` dict for daily rate limit caching.
 - **Campaign** (`linkedin/models.py`) — `name` (unique), `account` FK (was `users` M2M), `product_docs`, `campaign_objective`, `booking_link`, `is_freemium`, `action_fraction`, `seed_public_ids` (JSONField), `active` (default `False` — flipped via API). Constraint: `one_active_campaign_per_account` partial unique index on `(account)` where `active=True`.
 - **SearchKeyword** (`linkedin/models.py`) — FK to Campaign. `keyword`, `used`, `used_at`. Unique on `(campaign, keyword)`.
@@ -127,7 +128,7 @@ Three apps in `INSTALLED_APPS`:
 - **`db/deals.py`** — Deal/state ops, `set_profile_state()`, `increment_connect_attempts()`, `create_freemium_deal()`.
 - **`db/chat.py`** — `sync_conversation()` (fetch from Voyager API + upsert to ChatMessage), `_read_from_db()` (read all messages for a lead).
 - **`url_utils.py`** — `url_to_public_id()`, `public_id_to_url()` — LinkedIn URL ↔ public identifier conversion. Pure utility, no DB dependency.
-- **`conf.py`** — Config constants, `CAMPAIGN_CONFIG`, `get_llm_config()` (reads from `SiteConfig` in DB). Config loading (dotenv), `CAMPAIGN_CONFIG`, path constants. Timing constants (`MIN_DELAY`, `MAX_DELAY`, `ACTIVE_START_HOUR`, `ACTIVE_END_HOUR`, `ACTIVE_TIMEZONE`, `MIN_ACTION_INTERVAL`) are env-var configurable for per-worker anti-detection jitter.
+- **`conf.py`** — Config constants, `CAMPAIGN_CONFIG`, `get_llm_config()` (reads `LLM_API_KEY` / `AI_MODEL` / `LLM_API_BASE` from environment). Path constants. Timing constants (`MIN_DELAY`, `MAX_DELAY`, `ACTIVE_START_HOUR`, `ACTIVE_END_HOUR`, `ACTIVE_TIMEZONE`, `MIN_ACTION_INTERVAL`) are env-var configurable for per-worker anti-detection jitter.
 - **`exceptions.py`** — `AuthenticationError`, `TerminalStateError`, `SkipProfile`, `ReachedConnectionLimit`.
 - **`onboarding.py`** — Interactive setup.
 - **`agents/follow_up.py`** — Follow-up agent. Single LLM call with structured output (`FollowUpDecision`). Conversation is read in Python and injected into the prompt. No tool-calling loop.
@@ -143,13 +144,13 @@ Three apps in `INSTALLED_APPS`:
 - **`setup/self_profile.py`** — `discover_self_profile()` — fetches self profile via Voyager API, sets `account.self_lead`.
 - **`setup/seeds.py`** — User-provided seed profiles: parse URLs, create Leads + QUALIFIED Deals.
 - **`management/setup_crm.py`** — Idempotent CRM bootstrap (Site creation).
-- **`admin.py`** — Django Admin: SiteConfig, Campaign, LinkedInAccount, SearchKeyword, ActionLog, Task, ChatMessage.
+- **`admin.py`** — Django Admin: Campaign, LinkedInAccount, SearchKeyword, ActionLog, Task, ChatMessage. `SiteConfig` is NOT registered — LLM config lives in `.env`.
 - **`django_settings.py`** —  PostgreSQL by default (env vars: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`); SQLite fallback when `DB_ENGINE=django.db.backends.sqlite3`. Apps: crm, chat, linkedin. Django settings (SQLite at `data/db.sqlite3`). Apps: crm, chat, linkedin.
 - **`premigrations/`** — Pre-Django filesystem migrations. Numbered `NNNN_*.py` files with `forward(root_dir)` functions. Runner in `__init__.py` discovers and applies unapplied migrations, tracked via `data/.premigrations` JSON file.
 
 ## Configuration
 
-- **`SiteConfig`** (DB singleton) — `llm_api_key` (required), `ai_model` (required), `llm_api_base` (optional). Editable via Django Admin. For Docker, pass via `docker run -e`.
+- **LLM config** — `LLM_API_KEY` (required), `AI_MODEL` (required), `LLM_API_BASE` (optional, defaults to OpenAI). Set in `.env`; propagated to `admin` and `worker-pool` services via `local.yml` / `production.yml`. Read at process start by `linkedin.conf.get_llm_config()`. Rotating a key requires restarting the admin and worker containers.
 - **`conf.py` schedule** — `ACTIVE_START_HOUR` (9), `ACTIVE_END_HOUR` (17), `ACTIVE_TIMEZONE` ("UTC"), `REST_DAYS` ((5, 6) = Sat+Sun). All overridable via env vars for per-worker timing isolation. Daemon sleeps outside this window.
 - **`conf.py:CAMPAIGN_CONFIG`** — `min_ready_to_connect_prob` (0.9), `min_positive_pool_prob` (0.20), `connect_delay_seconds` (10), `connect_no_candidate_delay_seconds` (300), `check_pending_recheck_after_hours` (24), `check_pending_jitter_factor` (0.2), `qualification_n_mc_samples` (100), `enrich_min_interval` (1), `min_action_interval` (120), `embedding_model` ("BAAI/bge-small-en-v1.5").
 - **`conf.py` REST API & webhooks** — `API_KEY` (Bearer token for API auth), `WEBHOOK_URL` (POST target for incoming message notifications), `WEBHOOK_SECRET` (sent as `X-Webhook-Secret` header), `CHECK_INBOX_INTERVAL_SECONDS` (default 300). All from env vars.

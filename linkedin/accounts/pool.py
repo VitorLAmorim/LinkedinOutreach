@@ -18,8 +18,12 @@ from django.utils import timezone
 logger = logging.getLogger(__name__)
 
 # A claim is considered stale if no heartbeat for this many seconds.
-# The daemon loop heartbeats every _IDLE_POLL_INTERVAL (5s), so 60s is 12x.
-STALE_CLAIM_TIMEOUT = 60
+# The daemon loop heartbeats every _IDLE_POLL_INTERVAL (5s) in steady state,
+# but long blocking operations (e.g. playwright_login waiting on a captcha)
+# can gap heartbeats for several minutes. 180s (12x the cooperative login
+# heartbeat interval of 15s) prevents spurious claim stealing during those
+# gaps while still recovering from a truly dead worker in a few minutes.
+STALE_CLAIM_TIMEOUT = 180
 
 
 def claim_next_account(worker_id: str):

@@ -31,6 +31,14 @@ BROWSER_SLOW_MO = 200
 BROWSER_DEFAULT_TIMEOUT_MS = 30_000
 BROWSER_LOGIN_TIMEOUT_MS = 40_000
 BROWSER_NAV_TIMEOUT_MS = 10_000
+# Extra wait on /checkpoint/challenge/ (captcha, email/phone verification).
+# The operator must solve the challenge manually via VNC; this is the hard
+# cap on how long the worker waits for the URL to leave the checkpoint path.
+# Defaults to 10 minutes; override with BROWSER_LOGIN_CHALLENGE_TIMEOUT_SECONDS
+# if your workflow needs longer.
+BROWSER_LOGIN_CHALLENGE_TIMEOUT_MS = int(
+    os.getenv("BROWSER_LOGIN_CHALLENGE_TIMEOUT_SECONDS", "600")
+) * 1000
 HUMAN_TYPE_MIN_DELAY_MS = 50
 HUMAN_TYPE_MAX_DELAY_MS = 200
 
@@ -68,14 +76,22 @@ CAMPAIGN_CONFIG = {
 }
 
 # ----------------------------------------------------------------------
-# Global OpenAI / LLM config (stored in DB via SiteConfig)
+# Global OpenAI / LLM config (env vars, set in .env)
 # ----------------------------------------------------------------------
 
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "")
+LLM_API_BASE = os.getenv("LLM_API_BASE", "")
+
+
 def get_llm_config():
-    """Return (llm_api_key, ai_model, llm_api_base) from the DB."""
-    from linkedin.models import SiteConfig
-    cfg = SiteConfig.load()
-    return cfg.llm_api_key, cfg.ai_model, cfg.llm_api_base or None
+    """Return (llm_api_key, ai_model, llm_api_base) read from env vars.
+
+    Returns empty strings when unset; callers validate and emit their own
+    actionable error message (e.g. rundaemon checks ``llm_api_key`` and
+    exits with a pointer to the `.env` file).
+    """
+    return LLM_API_KEY, AI_MODEL, (LLM_API_BASE or None)
 
 PROXY_URL = os.getenv("PROXY_URL")
 

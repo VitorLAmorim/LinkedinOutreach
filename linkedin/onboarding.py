@@ -1,5 +1,9 @@
 # linkedin/onboarding.py
-"""Onboarding: create Campaign + LinkedInAccount + LLM config in DB.
+"""Onboarding: create Campaign + LinkedInAccount records.
+
+LLM config (``LLM_API_KEY``, ``AI_MODEL``, ``LLM_API_BASE``) lives in `.env`
+and is read at process start via ``linkedin.conf.get_llm_config``. The
+onboarding wizard no longer collects or writes LLM values.
 
 Two ways to supply config:
 - OnboardConfig.from_json(path) — from a JSON file (non-interactive / cloud).
@@ -32,7 +36,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OnboardConfig:
-    """All values needed to onboard — filled interactively or from JSON."""
+    """All values needed to onboard — filled interactively or from JSON.
+
+    LLM config lives in `.env`, not here — see ``linkedin.conf.LLM_API_KEY``.
+    """
 
     linkedin_email: str = ""
     linkedin_password: str = ""
@@ -41,9 +48,6 @@ class OnboardConfig:
     campaign_objective: str = ""
     booking_link: str = ""
     seed_urls: str = ""
-    llm_api_key: str = ""
-    ai_model: str = ""
-    llm_api_base: str = ""
     newsletter: bool = True
     connect_daily_limit: int = DEFAULT_CONNECT_DAILY_LIMIT
     connect_weekly_limit: int = DEFAULT_CONNECT_WEEKLY_LIMIT
@@ -72,13 +76,16 @@ _ACCOUNT_KEYS = {
     "connect_daily_limit", "connect_weekly_limit", "follow_up_daily_limit",
     "legal_acceptance",
 }
-_LLM_KEYS = {"llm_api_key", "ai_model", "llm_api_base"}
-_ALL_KEYS = _CAMPAIGN_KEYS | _ACCOUNT_KEYS | _LLM_KEYS
+_ALL_KEYS = _CAMPAIGN_KEYS | _ACCOUNT_KEYS
 
 
 def missing_keys() -> set[str]:
-    """Return onboarding field keys that still need values."""
-    from linkedin.models import Campaign, LinkedInAccount, SiteConfig
+    """Return onboarding field keys that still need values.
+
+    LLM config is not reported here — it lives in `.env` and is validated
+    by ``rundaemon`` directly before the task loop starts.
+    """
+    from linkedin.models import Campaign, LinkedInAccount
 
     keys: set[str] = set()
 
@@ -87,14 +94,6 @@ def missing_keys() -> set[str]:
 
     if not LinkedInAccount.objects.filter(active=True).exists():
         keys |= _ACCOUNT_KEYS
-
-    cfg = SiteConfig.load()
-    if not cfg.llm_api_key:
-        keys.add("llm_api_key")
-    if not cfg.ai_model:
-        keys.add("ai_model")
-    if not cfg.llm_api_base:
-        keys.add("llm_api_base")
 
     return keys
 
@@ -111,8 +110,11 @@ def collect_from_wizard() -> OnboardConfig:
     from openoutreach.prompts import SELF_HOSTED_QUESTIONS
     from openoutreach.wizard import ask
 
-    skip = _ALL_KEYS - missing_keys()
-    questions = [q for q in SELF_HOSTED_QUESTIONS if q.key not in skip]
+    # LLM config has moved to `.env`; skip any LLM questions the upstream
+    # prompt set still ships with so the wizard doesn't ask the operator
+    # for values that would be ignored anyway.
+    _WIZARD_SKIP = (_ALL_KEYS - missing_keys()) | {"llm_api_key", "ai_model", "llm_api_base"}
+    questions = [q for q in SELF_HOSTED_QUESTIONS if q.key not in _WIZARD_SKIP]
     if not questions or not any(q.required for q in questions):
         return OnboardConfig()
 
@@ -229,21 +231,7 @@ def apply(config: OnboardConfig) -> None:
         )
         _create_seed_leads(campaign, config.seed_urls)
 
-    # LLM config → DB
-    from linkedin.models import SiteConfig
-    cfg = SiteConfig.load()
-    updated = False
-    for field, val in [
-        ("llm_api_key", config.llm_api_key),
-        ("ai_model", config.ai_model),
-        ("llm_api_base", config.llm_api_base),
-    ]:
-        if val:
-            setattr(cfg, field, val)
-            updated = True
-    if updated:
-        cfg.save()
-        logger.info("LLM config saved to database.")
+    # LLM config is read from env vars on process start (see linkedin.conf).
 
     # Legal
     if config.legal_acceptance:

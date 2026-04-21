@@ -1,0 +1,227 @@
+# production.yml — Hetzner single-host deployment
+#
+# Topology (see docs/deploy.md for the full runbook):
+#
+#   Internet ──┬── tcp/443 → caddy → edge network → admin:8000
+#              ├── tcp/80  → caddy (ACME + redirect)
+#              └── udp/51820 → wireguard → internal network
+#
+#                    internal network (no host ports)
+#                    ├── postgres:5432
+#                    └── worker-pool:5900/6080 (xN)
+#
+# Only three services publish host ports: caddy (80, 443) and wireguard
+# (51820/udp). Everything else is reachable only from inside the Docker
+# network — operator access goes through the WG tunnel, CRM/MCP access
+# goes through Caddy with IP allowlist + bearer token.
+#
+# Usage:
+#
+#   1. Copy .env.copy to .env, fill in every variable.
+#      chmod 600 .env
+#
+#   2. First boot:
+#      docker compose -f production.yml up -d
+#      docker compose -f production.yml logs -f caddy  # watch ACME cert
+#
+#   3. Scale workers:
+#      docker compose -f production.yml up -d --scale worker-pool=3
+#
+#   4. Grab WireGuard peer config for your laptop:
+#      docker compose -f production.yml exec wireguard show peer1
+#
+# Requirements on the host:
+#   - Hetzner Cloud Firewall (primary gate) with rules documented in
+#     docs/deploy.md. Nothing else on the host should listen.
+#   - DNS A record CADDY_HOSTNAME → the VM's public IPv4.
+#   - A Hetzner Volume mounted at /mnt/postgres-data so the DB survives
+#     VM rebuilds. Bind-mounted into the postgres service below.
+
+x-worker-base: &worker-base
+  build:
+    context: .
+    dockerfile: ./compose/linkedin/Dockerfile
+    args:
+      - BUILD_ENV=local
+  restart: unless-stopped
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  # Chromium uses /dev/shm heavily; 64 MB default crashes under load.
+  shm_size: 2gb
+  depends_on:
+    - postgres
+  volumes:
+    - .:/app
+  networks:
+    - internal
+
+x-worker-env: &worker-env
+  PROXY_URL: ""
+  WEBHOOK_URL: ${WEBHOOK_URL:-}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+  # LLM config — read from .env (see .env.copy LLM section).
+  LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set in .env}
+  AI_MODEL: ${AI_MODEL:?AI_MODEL must be set in .env}
+  LLM_API_BASE: ${LLM_API_BASE:-}
+  MIN_DELAY: "15"
+  MAX_DELAY: "30"
+  ACTIVE_START_HOUR: "10"
+  ACTIVE_END_HOUR: "20"
+  MIN_ACTION_INTERVAL: "120"
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  # Operator-only VNC over the WG tunnel. The pool worker's 5900/6080 ports
+  # are on the internal Docker network only; Hetzner firewall blocks them
+  # from the internet entirely.
+  ENABLE_VNC: "true"
+
+services:
+  # ───────────────────────────────────────────────────────────────────────
+  # Postgres — internal only. Data lives on a Hetzner Volume mounted at
+  # /mnt/postgres-data on the host so the DB survives VM rebuilds.
+  # ───────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    volumes:
+      - /mnt/postgres-data:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Django admin + REST API — joined to BOTH networks so Caddy (on edge)
+  # can reach it and Postgres (on internal) remains reachable. No host
+  # port binding; the only inbound path is caddy → admin:8000.
+  # ───────────────────────────────────────────────────────────────────────
+  admin:
+    build:
+      context: .
+      dockerfile: ./compose/linkedin/Dockerfile
+      args:
+        - BUILD_ENV=local
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      RUN_MODE: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env}
+      DJANGO_DEBUG: "False"
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS must be set in .env}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+      API_KEY: ${API_KEY:?API_KEY must be set in .env}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set in .env}
+      AI_MODEL: ${AI_MODEL:?AI_MODEL must be set in .env}
+      LLM_API_BASE: ${LLM_API_BASE:-}
+    volumes:
+      - .:/app
+    networks:
+      - edge
+      - internal
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Pool-mode worker — dynamically claims an eligible account on startup.
+  # Scale with: docker compose -f production.yml up -d --scale worker-pool=N
+  # VNC on 5900 and noVNC on 6080 are reachable ONLY over the WG tunnel
+  # (internal network), never from the host or internet.
+  # ───────────────────────────────────────────────────────────────────────
+  worker-pool:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      LINKEDIN_PROFILE: ""
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Caddy reverse proxy — the only public HTTP/HTTPS entry point.
+  #   - Auto-provisions Let's Encrypt certs via ACME HTTP-01 on port 80
+  #   - Terminates TLS on port 443
+  #   - Proxies ONLY /api/* to admin:8000, with IP allowlist + rate limit
+  #   - Returns 404 for /admin/, /static/, /, and everything else
+  #
+  # Caddy joins the edge network only — it cannot reach postgres or the
+  # worker pool. The admin service spans both networks, so Caddy reaches
+  # it via `admin:8000` on edge and admin talks to Postgres on internal.
+  # ───────────────────────────────────────────────────────────────────────
+  caddy:
+    build:
+      context: ./compose/caddy
+    restart: unless-stopped
+    depends_on:
+      - admin
+    environment:
+      CADDY_HOSTNAME: ${CADDY_HOSTNAME:?CADDY_HOSTNAME must be set in .env}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?CADDY_ACME_EMAIL must be set in .env}
+      CADDY_API_ALLOWLIST: ${CADDY_API_ALLOWLIST:?CADDY_API_ALLOWLIST must be set in .env}
+    volumes:
+      - ./compose/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - edge
+
+  # ───────────────────────────────────────────────────────────────────────
+  # WireGuard operator VPN — the only way for the operator to reach the
+  # Django admin panel and worker VNC/noVNC endpoints. Joined to the
+  # internal network so WG peers can resolve `admin`, `postgres`, and
+  # `worker-pool` via Docker's built-in DNS.
+  #
+  # First boot: grab the peer config with:
+  #   docker compose -f production.yml exec wireguard show peer1
+  # Then import the config into the WireGuard client on your laptop.
+  # ───────────────────────────────────────────────────────────────────────
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "UTC"
+      SERVERURL: ${WG_SERVER_URL:?WG_SERVER_URL must be set in .env}
+      SERVERPORT: "51820"
+      PEERS: ${WG_PEERS:-1}
+      # Route the internal Docker network through the tunnel so peers can
+      # reach admin:8000 and worker-pool:6080 via Docker's internal DNS.
+      PEERDNS: "127.0.0.11"
+      INTERNAL_SUBNET: "10.13.13.0"
+      ALLOWEDIPS: "10.13.13.0/24,172.28.0.0/16"
+    volumes:
+      - wireguard-config:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "51820:51820/udp"
+    networks:
+      - internal
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  caddy-data:
+  caddy-config:
+  wireguard-config:

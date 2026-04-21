@@ -22,7 +22,7 @@ from linkedin.conf import (
     REST_DAYS,
 )
 from linkedin.diagnostics import failure_diagnostics
-from linkedin.exceptions import AuthenticationError
+from linkedin.exceptions import AuthenticationError, LoginFailed
 from linkedin.ml.qualifier import BayesianQualifier, KitQualifier
 from linkedin.models import Task
 from linkedin.tasks.check_inbox import handle_check_inbox
@@ -295,7 +295,19 @@ def _refresh_account_binding(session, worker_id: str) -> bool:
         return True
 
     session.swap_account(new_account)
-    session.ensure_browser()
+    try:
+        session.ensure_browser()
+    except LoginFailed:
+        # Login failed (captcha timeout, claim stolen mid-login, etc.).
+        # Release the claim and idle so the next loop iteration can try
+        # again instead of crashing the whole worker process.
+        logger.exception(
+            "Login failed for swapped account %s — releasing and idling",
+            new_account.username,
+        )
+        release_account(new_account, worker_id)
+        session.close()
+        session.account = _PlaceholderAccount()
     return True
 
 
@@ -479,7 +491,7 @@ def run_daemon(session, worker_id: str = ""):
             task.mark_failed(str(e))
             logger.error(
                 colored("Daemon stopped — OpenAI API error", "red", attrs=["bold"])
-                + "\n%s\nCheck ai_model, llm_api_key, and llm_api_base in Admin → Site Configuration.", e,
+                + "\n%s\nCheck LLM_API_KEY, AI_MODEL, and LLM_API_BASE in the .env file.", e,
             )
             return
         except Exception:

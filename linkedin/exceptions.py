@@ -32,3 +32,11 @@ class LeadNotFoundError(Exception):
     """send_message task received a public_id with no matching Lead."""
     pass
 
+
+class LoginFailed(Exception):
+    """playwright_login could not reach /feed — captcha unsolved, timeout,
+    or claim was stolen mid-login. Callers should release the claim and
+    retry on the next loop iteration rather than crashing the worker.
+    """
+    pass
+

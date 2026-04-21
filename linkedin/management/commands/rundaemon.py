@@ -47,10 +47,29 @@ class Command(BaseCommand):
         from linkedin.browser.session import install_shutdown_handler
         install_shutdown_handler(session)
 
-        self._ensure_newsletter(session)
+        # Any unhandled exception from _ensure_newsletter or run_daemon must
+        # release the pool claim before the process exits, otherwise the next
+        # worker must wait the full STALE_CLAIM_TIMEOUT (180s) before picking
+        # up this account. SIGTERM/SIGINT are already handled by
+        # install_shutdown_handler; this try/except covers the Python
+        # exception path (login failures, PlaywrightTimeoutError, etc.).
+        try:
+            self._ensure_newsletter(session)
 
-        from linkedin.daemon import run_daemon
-        run_daemon(session, worker_id=worker_id if not profile else "")
+            from linkedin.daemon import run_daemon
+            run_daemon(session, worker_id=worker_id if not profile else "")
+        except Exception:
+            if not profile and worker_id and getattr(session.account, "pk", None):
+                try:
+                    from linkedin.accounts.pool import release_account
+                    release_account(session.account, worker_id)
+                    logger.warning(
+                        "Released pool claim on %s after unhandled exception",
+                        session.account.username,
+                    )
+                except Exception:
+                    logger.exception("Failed to release claim on unhandled exception")
+            raise
 
     # -- Steps ---------------------------------------------------------------
 
@@ -103,7 +122,7 @@ class Command(BaseCommand):
 
         llm_api_key, _, _ = get_llm_config()
         if not llm_api_key:
-            logger.error("LLM_API_KEY is required. Set it in Site Configuration (Django Admin).")
+            logger.error("LLM_API_KEY is required. Set it in the .env file.")
             sys.exit(1)
 
         claim_holder: dict = {"account": None}
@@ -129,6 +148,15 @@ class Command(BaseCommand):
             time.sleep(300)
 
         session = get_or_create_session(account)
+        # Bind the worker_id to the session immediately — BEFORE returning
+        # to the caller, who will then trigger `_ensure_newsletter` which can
+        # run a full login (including a 10-minute captcha wait). The cooperative
+        # heartbeat inside `_wait_for_login_redirect` reads `session._worker_id`
+        # to decide whether to refresh the claim. If we only bind this inside
+        # run_daemon (as we used to), the captcha wait during the newsletter
+        # path runs with worker_id="" and skips the heartbeat — letting another
+        # worker steal the claim after STALE_CLAIM_TIMEOUT seconds.
+        session.bind_worker_id(worker_id)
         if session.campaigns:
             campaign = next(
                 (c for c in session.campaigns if not c.is_freemium), None,
@@ -144,7 +172,7 @@ class Command(BaseCommand):
 
         llm_api_key, _, _ = get_llm_config()
         if not llm_api_key:
-            logger.error("LLM_API_KEY is required. Set it in Site Configuration (Django Admin).")
+            logger.error("LLM_API_KEY is required. Set it in the .env file.")
             sys.exit(1)
 
         account = resolve_account(account_username) if account_username else get_first_active_account()

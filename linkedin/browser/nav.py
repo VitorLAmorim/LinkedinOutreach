@@ -11,6 +11,18 @@ from linkedin.exceptions import SkipProfile
 logger = logging.getLogger(__name__)
 
 
+def _url_path(url: str) -> str:
+    """Return just the path segment of a URL (no query string, no fragment).
+
+    Used by ``goto_page`` so URL-pattern checks aren't fooled by redirects
+    that encode the target in the query string. LinkedIn sends stale-cookie
+    holders to ``/uas/login?session_redirect=https%3A%2F%2F...%2Ffeed%2F`` —
+    checking the whole URL would false-positive on `/feed` even though the
+    user is still on the login page.
+    """
+    return unquote(urlparse(url).path)
+
+
 def goto_page(session,
               action,
               expected_url_pattern: str,
@@ -23,17 +35,22 @@ def goto_page(session,
         return
 
     try:
-        page.wait_for_url(lambda url: expected_url_pattern in unquote(url), timeout=timeout)
+        page.wait_for_url(
+            lambda url: expected_url_pattern in _url_path(url),
+            timeout=timeout,
+        )
     except PlaywrightTimeoutError:
         pass  # we still continue and check URL below
 
     session.wait()
 
-    current = unquote(page.url)
-    if expected_url_pattern not in current:
-        if "/404" in current:
-            raise SkipProfile(f"Profile returned 404 → {current}")
-        raise RuntimeError(f"{error_message} → expected '{expected_url_pattern}' | got '{current}'")
+    current_path = _url_path(page.url)
+    if expected_url_pattern not in current_path:
+        if "/404" in current_path:
+            raise SkipProfile(f"Profile returned 404 → {page.url}")
+        raise RuntimeError(
+            f"{error_message} → expected '{expected_url_pattern}' | got '{page.url}'"
+        )
 
     logger.debug("Navigated to %s", page.url)
 

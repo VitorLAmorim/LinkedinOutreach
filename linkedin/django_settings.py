@@ -14,11 +14,33 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 BASE_DIR = ROOT_DIR
 
-SECRET_KEY = "openoutreach-local-dev-key-change-in-production"
+_DEV_SECRET_KEY = "openoutreach-local-dev-key-change-in-production"
+SECRET_KEY = os.environ.get("SECRET_KEY", _DEV_SECRET_KEY)
 
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").strip().lower() in ("1", "true", "yes")
 
-ALLOWED_HOSTS = ["*"]
+# Hard fail if a production deploy tries to start with the dev key. This is
+# the minimum guardrail — the rest of the Django-level hardening (SECURE_HSTS,
+# SECURE_*_COOKIE, etc.) is a separate follow-up phase.
+if not DEBUG and SECRET_KEY == _DEV_SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY must be set via environment variable when DJANGO_DEBUG=False"
+    )
+
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
+]
+
+# Caddy terminates TLS in production and forwards X-Forwarded-Proto=https to
+# the admin container. Tell Django to trust the header so request.is_secure()
+# returns True, which lets CSRF + redirects work behind the reverse proxy.
+# Only set in production so local runserver (http://) is not confused.
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     "django.contrib.sites",

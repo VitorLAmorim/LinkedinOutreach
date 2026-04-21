@@ -27,6 +27,9 @@ x-worker-base: &worker-base
   stdin_open: true
   tty: true
   user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  # Chromium uses /dev/shm heavily for its render pipeline; Docker's 64 MB
+  # default causes crashes under load. 2 GB matches the production setting.
+  shm_size: 2gb
   depends_on:
     - postgres
   volumes:
@@ -36,6 +39,10 @@ x-worker-env: &worker-env
   PROXY_URL: "" # Set per-account via LinkedInAccount.proxy_url (PATCH /api/accounts/<id>/). Use unique residential proxies in production.
   WEBHOOK_URL: ${WEBHOOK_URL:-}
   WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+  # LLM config — read from .env (see .env.copy LLM section).
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  AI_MODEL: ${AI_MODEL:-}
+  LLM_API_BASE: ${LLM_API_BASE:-}
   # Per-worker timing (anti-detection — vary across workers):
   MIN_DELAY: "15"
   MAX_DELAY: "30"
@@ -81,6 +88,9 @@ services:
       API_KEY: ${API_KEY:?API_KEY must be set in .env}
       WEBHOOK_URL: ${WEBHOOK_URL:-}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      LLM_API_BASE: ${LLM_API_BASE:-}
     volumes:
       - .:/app
     ports:

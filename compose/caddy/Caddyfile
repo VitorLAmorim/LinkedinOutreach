@@ -1,0 +1,74 @@
+# Caddyfile — public entry point for the OpenOutreach production deploy.
+#
+# What this enforces:
+#   1. TLS via Let's Encrypt on {$CADDY_HOSTNAME} (ACME HTTP-01 over port 80).
+#   2. HTTP → HTTPS redirect for every request on :80.
+#   3. /api/* is proxied to admin:8000 only after passing:
+#        - IP allowlist (CRM + MCP + operator debug IPs)
+#        - rate limit (60 req/min per source IP)
+#        - the Django `require_api_key` bearer token check (defense in depth)
+#   4. Every other path returns 404 directly from Caddy. The Django admin
+#      login form is NEVER reachable from the internet — operators use the
+#      WireGuard tunnel instead.
+#
+# Config via environment variables (set in .env, referenced here):
+#   CADDY_HOSTNAME          — the public hostname (matches the DNS A record)
+#   CADDY_ACME_EMAIL        — Let's Encrypt contact address
+#   CADDY_API_ALLOWLIST     — whitespace-separated CIDR blocks for /api/*
+#
+# Editing the allowlist: update CADDY_API_ALLOWLIST in .env, then run
+#   docker compose -f production.yml exec caddy caddy reload \
+#     --config /etc/caddy/Caddyfile
+# which hot-reloads the matcher without dropping in-flight connections.
+
+{
+	email {$CADDY_ACME_EMAIL}
+	# Uncomment for local testing against Let's Encrypt staging (no rate limits):
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$CADDY_HOSTNAME} {
+	# ── Named matcher: the /api/* allowlist ────────────────────────────────
+	# CADDY_API_ALLOWLIST is a whitespace-separated list of CIDRs; Caddy's
+	# `remote_ip` matcher accepts them directly. Example .env value:
+	#   CADDY_API_ALLOWLIST=1.2.3.4/32 5.6.7.8/32 10.0.0.0/24
+	@api_allowed {
+		path /api/*
+		remote_ip {$CADDY_API_ALLOWLIST}
+	}
+
+	# ── Allowed /api/* requests: rate-limited, then proxied to Django ──────
+	# Rate limit is 60 requests per minute per source IP, cheap protection
+	# against a compromised allowlisted consumer going berserk. Requires
+	# the `caddy-ratelimit` plugin baked in via compose/caddy/Dockerfile.
+	handle @api_allowed {
+		rate_limit {
+			zone api_per_ip {
+				key {remote_host}
+				events 60
+				window 1m
+			}
+		}
+		reverse_proxy admin:8000 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# ── /api/* from a non-allowlisted IP: 403 before Django sees it ────────
+	handle /api/* {
+		respond "Forbidden" 403
+	}
+
+	# ── Everything else: 404 from Caddy (no Django login, no static) ───────
+	handle {
+		respond "Not Found" 404
+	}
+
+	# ── Logging ────────────────────────────────────────────────────────────
+	log {
+		output stdout
+		format json
+	}
+}
