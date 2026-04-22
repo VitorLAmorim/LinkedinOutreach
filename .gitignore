@@ -17,5 +17,5 @@ __pycache__/
 .cache/
 tests/fixtures/pages/**/*.html
 
-dump.sql
-dump.json
+*.sql
+*.dump
