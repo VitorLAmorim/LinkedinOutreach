@@ -11,5 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Seed .env for compose
+        # local.yml uses ${API_KEY:?...} which compose resolves at parse time
+        # against the shell env + a .env file next to the compose file. The
+        # runner has neither, so write a minimal .env with dummy values. The
+        # test suite never dereferences these — they just satisfy compose's
+        # required-variable guard.
+        run: |
+          cat > .env <<'EOF'
+          API_KEY=ci-dummy-key
+          EOF
+
       - name: Run tests
         run: HOST_UID=$(id -u) HOST_GID=$(id -g) make docker-test
