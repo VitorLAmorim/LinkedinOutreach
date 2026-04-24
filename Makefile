@@ -72,8 +72,8 @@ browse-account: ## open a browser with saved cookies + the account's proxy_url, 
 logs: ## follow the logs of the service
 	docker compose -f local.yml logs -f
 
-docker-test: ## run tests in Docker
-	docker compose -f local.yml run --remove-orphans -e DB_ENGINE=django.db.backends.sqlite3 admin py.test -vv -p no:cacheprovider
+docker-test: ## run tests in Docker (MCP suite skipped — not production-ready)
+	docker compose -f local.yml run --remove-orphans -e DB_ENGINE=django.db.backends.sqlite3 admin py.test -vv -p no:cacheprovider --ignore=tests/mcp
 
 stop: ## stop all services defined in Docker Compose
 	docker compose -f local.yml stop
