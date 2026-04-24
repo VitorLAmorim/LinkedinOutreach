@@ -85,6 +85,7 @@ services:
       POSTGRES_DB: openoutreach
       POSTGRES_USER: openoutreach
       POSTGRES_PASSWORD: openoutreach
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-https://*.app.github.dev}
       API_KEY: ${API_KEY:?API_KEY must be set in .env}
       WEBHOOK_URL: ${WEBHOOK_URL:-}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}

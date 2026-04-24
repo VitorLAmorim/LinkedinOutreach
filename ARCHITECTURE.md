@@ -23,7 +23,7 @@ Docker `start` script dispatches on `RUN_MODE` env var: `admin` (Django Admin we
 
 - `onboard` — standalone onboarding (interactive or `--non-interactive` with `--config-file` / individual flags).
 - `setup_account <username>` — interactive VNC login for a LinkedIn account (polls for auth cookie, saves session).
-- `browse_account <username>` — browser + VNC for manual navigation (no daemon, no automation).
+- `browse_account <username>` — launches Playwright with the account's `proxy_url` + saved `cookie_data` (if any), navigates to `/feed` (or `/login` if no cookies), then blocks on `signal.pause()` for free VNC use. No login detection, no timeout — runs until `docker stop` / Ctrl+C. SIGTERM/SIGINT close the browser cleanly.
 - `setup_crm` — idempotent CRM bootstrap (default Site).
 - `add_seeds` — add seed LinkedIn profile URLs to a campaign.
 
